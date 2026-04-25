@@ -1,0 +1,8 @@
+# ArcGIS Pro ships its own Python environment (arcpy, arcgis).
+# Install these packages into that environment via the ArcGIS Pro
+# Python Package Manager or: conda install --name arcgispro-py3 <pkg>
+
+pandas>=2.0
+xgboost>=2.0
+scikit-learn>=1.4
+python-dotenv>=1.0

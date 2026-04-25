@@ -1,280 +1,237 @@
-import os
-import time
+from pathlib import Path
+
 import arcpy
-import shutil
-from arcpy import gapro
+
+from configs.settings import (
+    GOVT_OVERLAP_THRESHOLD,
+    GAP_ACRE_THRESHOLD,
+    OVERLAP_SLIVER_THRESHOLD,
+    QC_LARGE_PARCEL_THRESHOLD,
+    NULL_OWNER_SENTINEL,
+)
+from geoprocessing.base_model import BaseModel
 
 
+class PLR_QC_model(BaseModel):
+    """Quality-control stage that reconciles XGBoost vs GIS model disagreements."""
 
-start = time.time()
-month = time.strftime("%m")
-year = time.strftime("%Y")
-
-def get_quarter(month, year):
-    if month in ['01', '02', '03']:
-        return f'Q1_{year}'
-    elif month in ['04', '05', '06']:
-        return f'Q2_{year}'
-    elif month in ['07', '08', '09']:
-        return f'Q3_{year}'
-    else:
-        return f'Q4_{year}'
-
-
-quarter = get_quarter(month, year)
-
-class PLR_QC_model:
-    def __init__(self, data, state, env='LOCAL'):
-        self.data = data
-        self.state = state
-        self.env = env
-
-        # set environment
-        if env == 'LOCAL':
-            self.workspace = os.getcwd()
-        else:
-            self.workspace = env
-
-        # set config
-        self.govt_land = data['govt_land']
-        self.parcels = data['parcels']
-
-        print(self.parcels)
-
-    def set_workspaces(self):
-        location = self.workspace
-        temp_folder = '{}_temp_{}.gdb'.format(self.state, quarter)
-        final_folder = '{}_private_land_{}.gdb'.format(self.state, quarter)
-        # temp
-        if os.path.exists(os.path.join(location, temp_folder)):
-            print('Temp workspace already exist at {}'.format(os.path.join(location, temp_folder)))
-        else:
-            arcpy.CreateFileGDB_management(location, temp_folder)
-            print('New temp workspace created at {}'.format(os.path.join(location, temp_folder)))
-
-        # final
-        if os.path.exists(os.path.join(location, final_folder)):
-            print('Final workspace already exist at {}'.format(os.path.join(location, final_folder)))
-        else:
-            arcpy.CreateFileGDB_management(location, final_folder)
-            print('Final workspace created at {}'.format(os.path.join(location, final_folder)))
-
-        self.temp_dir = os.path.join(location, temp_folder)
-        self.final_dir = os.path.join(location, final_folder)
-        temp_workspace_time = time.time()
-        print('time elapsed {}'.format(temp_workspace_time - start))
-
-    def qc_counts(self):
+    def qc_counts(self) -> None:
+        """Log parcel counts and model agreement rates."""
         parcel_count = int(arcpy.GetCount_management(self.parcels)[0])
-        print(f'{self.state} has {parcel_count} parcels')
+        self.logger.info("%s: %d total parcels", self.state, parcel_count)
 
-        model_agreement_rows = arcpy.SelectLayerByAttribute_management(self.parcels, "NEW_SELECTION", '"gh_govt" = "xgb_gh_govt"')
-        model_agreement_count = int(arcpy.GetCount_management(model_agreement_rows)[0])
-        print(f'{model_agreement_count} parcels with PLR model agreement')
-        print(f'{(model_agreement_count/parcel_count) * 100}% PLR model agreement rate in {self.state}')
-        print(f'Begining QC process for {parcel_count - model_agreement_count} parcels')
+        agreement_layer = arcpy.SelectLayerByAttribute_management(
+            self.parcels, "NEW_SELECTION", '"gh_govt" = "xgb_gh_govt"'
+        )
+        agreement_count = int(arcpy.GetCount_management(agreement_layer)[0])
+        agreement_pct = (agreement_count / parcel_count * 100) if parcel_count else 0
 
-    def label_qc(self):
-        arcpy.management.AddField(self.parcels, "qc", "SHORT")
+        self.logger.info(
+            "%s model agreement: %d / %d parcels (%.1f%%)",
+            self.state, agreement_count, parcel_count, agreement_pct,
+        )
+        self.logger.info(
+            "%s: %d parcels require QC", self.state, parcel_count - agreement_count
+        )
 
-        # add qc flag field for rows where model labels differ
-        flag_qc_fields = ['qc', 'gh_govt', 'xgb_gh_govt']
-        with arcpy.da.UpdateCursor(self.parcels, "qc", where_clause='gh_govt <> xgb_gh_govt') as cursor:
+    def label_qc(self) -> None:
+        """Apply business-logic QC flags and correct gh_govt labels on disagreeing parcels."""
+        try:
+            arcpy.management.AddField(self.parcels, 'qc', 'SHORT')
+            self.logger.info("qc field added")
+        except arcpy.ExecuteError:
+            self.logger.debug("qc field already exists, skipping")
+
+        with arcpy.da.UpdateCursor(
+            self.parcels, 'qc', where_clause='gh_govt <> xgb_gh_govt'
+        ) as cursor:
             for row in cursor:
                 row[0] = 1
                 cursor.updateRow(row)
 
-        # update gh_govt label for qc rows using business logic
-        print(f"QC'ing gh_govt label for {self.state}")
-        qc_fields = ['gh_govt', 'xgb_gh_govt', 'private_owner', 'gh_parcel_acres', 'qc', 'full_name', 'overlap_perc', 'govt_centroid', 'govt_owner']
+        self.logger.info("QC flag 1 applied to disagreeing parcels for %s", self.state)
+
+        qc_fields = [
+            'gh_govt', 'xgb_gh_govt', 'private_owner', 'gh_parcel_acres',
+            'qc', 'full_name', 'overlap_perc', 'govt_centroid', 'govt_owner',
+        ]
         with arcpy.da.UpdateCursor(self.parcels, qc_fields) as cursor:
             for row in cursor:
-                if (row[1] == 'FALSE' and row[0] == 'TRUE' and row[2] == 1 and row[3] >= 10 and row[4] == 1):
-                    row[0] = 'TRUE'
-                    row[4] = 2
-                elif (row[1] == 'FALSE' and row[0] == 'TRUE' and row[2] == 1 and row[3] < 10 and row[4] == 1):
-                    row[0] = 'FALSE'
-                    row[4] = 3
-                elif (row[4] == 1 and row[5] == '   ,    ' and row[6] >= 80):
-                    row[0] = 'TRUE'
-                    row[4] = 4
-                elif (row[4] == 1 and row[5] == '   ,    ' and row[6] < 80):
-                    row[0] = 'UNKNOWN'
-                    row[4] = 5
-                elif (row[4] == 1 and row[7] == 1 and row[8] == 1):
-                    row[0] = 'TRUE'
-                    row[4] = 6
-                elif row[4] == 1:
+                gh, xgb, priv_own, acres, qc, name, overlap, govt_cen, govt_own = row
+
+                if xgb == 'FALSE' and gh == 'TRUE' and priv_own == 1 and acres >= QC_LARGE_PARCEL_THRESHOLD and qc == 1:
+                    row[0], row[4] = 'TRUE', 2
+                elif xgb == 'FALSE' and gh == 'TRUE' and priv_own == 1 and acres < QC_LARGE_PARCEL_THRESHOLD and qc == 1:
+                    row[0], row[4] = 'FALSE', 3
+                elif qc == 1 and name == NULL_OWNER_SENTINEL and overlap >= GOVT_OVERLAP_THRESHOLD:
+                    row[0], row[4] = 'TRUE', 4
+                elif qc == 1 and name == NULL_OWNER_SENTINEL and overlap < GOVT_OVERLAP_THRESHOLD:
+                    row[0], row[4] = 'UNKNOWN', 5
+                elif qc == 1 and govt_cen == 1 and govt_own == 1:
+                    row[0], row[4] = 'TRUE', 6
+                elif qc == 1:
                     row[4] = 7
 
                 cursor.updateRow(row)
-        print(f"Label QC complete for {self.state}")
 
-    def gap_qc(self):
-        # Make a layer from the feature class
+        self.logger.info("Label QC complete for %s", self.state)
+
+    def gap_qc(self) -> None:
+        """Identify and insert gap features between govt-labelled parcels and the govt layer."""
         govt_true = f"{self.state}_GovtTrue"
-        arcpy.MakeFeatureLayer_management(self.parcels, govt_true, where_clause="gh_govt IN ('TRUE')")
+        arcpy.MakeFeatureLayer_management(
+            self.parcels, govt_true, where_clause="gh_govt IN ('TRUE')"
+        )
 
-        # symmetrical difference between govt layer and govt true parcel
-        sym_diff_fc = os.path.join(self.temp_dir, f"{self.state}_symDiff")
-        if arcpy.Exists(sym_diff_fc):
-            print(f"{self.state}_symDiff already exists")
+        sym_diff_fc: Path = self.temp_dir / f'{self.state}_symDiff'
+        if arcpy.Exists(str(sym_diff_fc)):
+            self.logger.info("%s_symDiff already exists", self.state)
         else:
-            arcpy.analysis.SymDiff(govt_true, self.govt_land, sym_diff_fc, join_attributes="ONLY_FID")
-            print(f"{self.state}_symDiff created")
+            arcpy.analysis.SymDiff(govt_true, self.govt_land, str(sym_diff_fc), join_attributes="ONLY_FID")
+            self.logger.info("%s_symDiff created", self.state)
 
-        # feature layer where symdiff is a gap
-        symDiff_gap = f"{self.state}_symDiff_gap"
-        parcel_layer_name = name = self.parcels.split('.gdb\\')[1]
-        field_name = 'FID_' + parcel_layer_name
-        where = f"{field_name} <> -1"
-        print(where)
-        arcpy.MakeFeatureLayer_management(sym_diff_fc, symDiff_gap, where_clause=where)
+        parcel_layer_name = self.parcels.split('.gdb\\')[1]
+        sym_diff_gap = f"{self.state}_symDiff_gap"
+        arcpy.MakeFeatureLayer_management(
+            str(sym_diff_fc), sym_diff_gap,
+            where_clause=f"FID_{parcel_layer_name} <> -1",
+        )
 
-        # multipart to single part
-        symDiff_singlePart_fc = os.path.join(self.temp_dir, f"{self.state}_SD_SP_fc")
-        if arcpy.Exists(symDiff_singlePart_fc):
-            print(f"{self.state}_symDiff_singlePart already exists")
+        sym_diff_sp: Path = self.temp_dir / f'{self.state}_SD_SP_fc'
+        if arcpy.Exists(str(sym_diff_sp)):
+            self.logger.info("%s_symDiff_singlePart already exists", self.state)
         else:
-            arcpy.MultipartToSinglepart_management(symDiff_gap, symDiff_singlePart_fc)
-            print(f"{self.state}_symDiff_singlePart created")
+            arcpy.MultipartToSinglepart_management(sym_diff_gap, str(sym_diff_sp))
+            arcpy.management.AddFields(str(sym_diff_sp), [
+                ['gap_acres', 'LONG', '', None, None, ''],
+                ['Unit_Nm',   'TEXT', '', None, None, ''],
+                ['gh_govtype','TEXT', '', None, None, ''],
+            ])
+            arcpy.management.CalculateField(str(sym_diff_sp), 'gap_acres', '!shape.area@acres!', 'PYTHON3')
+            self.logger.info("%s single-part gap acres calculated", self.state)
 
-            # add and calcualte acres to single part gaps
-            field_metadata = [['gap_acres', 'LONG', '', None, None, ''],
-                              ['Unit_Nm', 'TEXT', '', None, None, ''],
-                              ['gh_govtype', 'TEXT', '', None, None, '']]
-
-            arcpy.management.AddFields(symDiff_singlePart_fc, field_metadata)
-            arcpy.management.CalculateField(symDiff_singlePart_fc, "gap_acres", "!shape.area@acres!", "PYTHON3")
-            print(f"{self.state} single part gap acres calculated")
-
-        # delete large gaps
-        with arcpy.da.UpdateCursor(symDiff_singlePart_fc, "gap_acres") as cursor:
+        with arcpy.da.UpdateCursor(str(sym_diff_sp), 'gap_acres') as cursor:
             for row in cursor:
-                if row[0] >= 160:
-                    cursor.deleteRow ()
+                if row[0] >= GAP_ACRE_THRESHOLD:
+                    cursor.deleteRow()
+        self.logger.info("Gaps >= %d acres removed", GAP_ACRE_THRESHOLD)
 
-
-        # spatial join govt features to gap features
-        gap_spatial_join = os.path.join(self.temp_dir, f"{self.state}_gap_SJ")
-        if arcpy.Exists(gap_spatial_join):
-            print(f'{self.state} gap spatial join already exists')
+        gap_sj: Path = self.temp_dir / f'{self.state}_gap_SJ'
+        if arcpy.Exists(str(gap_sj)):
+            self.logger.info("%s gap spatial join already exists", self.state)
         else:
-            arcpy.analysis.SpatialJoin(symDiff_singlePart_fc, self.govt_land, gap_spatial_join, match_option='CLOSEST')
-            print(f'{self.state} gap spatial join complete')
+            arcpy.analysis.SpatialJoin(str(sym_diff_sp), self.govt_land, str(gap_sj), match_option='CLOSEST')
+            self.logger.info("%s gap spatial join complete", self.state)
 
-        gap_data = ["Unit_Nm_1", "gh_govtype_1", "SHAPE@"]
-        govt_fields = ["Unit_Nm", "gh_govtype", "SHAPE@"]
+        with arcpy.da.SearchCursor(str(gap_sj), ['Unit_Nm_1', 'gh_govtype_1', 'SHAPE@']) as s_cur:
+            with arcpy.da.InsertCursor(self.govt_land, ['Unit_Nm', 'gh_govtype', 'SHAPE@']) as i_cur:
+                for row in s_cur:
+                    i_cur.insertRow(row)
 
-        print("updating fields")
-        # insert each row from the orginal parcel layer into the df parcel feature class, with only the fields specified above
-        with arcpy.da.SearchCursor(gap_spatial_join, gap_data) as sCur:
-            with arcpy.da.InsertCursor(self.govt_land, govt_fields) as iCur:
-                for row in sCur:
-                    iCur.insertRow(row)
+        self.logger.info("Gap QC features inserted into govt land layer")
 
-    def overlap_qc(self):
-        # select private land
+    def overlap_qc(self) -> None:
+        """Erase government land from private parcels in overlapping areas."""
         govt_false = f"{self.state}_GovtFalse"
-        arcpy.MakeFeatureLayer_management(self.parcels, govt_false, where_clause="gh_govt IN ('FALSE')")
+        arcpy.MakeFeatureLayer_management(
+            self.parcels, govt_false, where_clause="gh_govt IN ('FALSE')"
+        )
 
-        # intersect to find where govt land overlaps private land
-        overlap_intx = os.path.join(self.temp_dir, f'{self.state}_govt_overlap_intx')
-        if arcpy.Exists(overlap_intx):
-            print(f'{self.state} govt overlap intx already exists')
+        overlap_intx: Path = self.temp_dir / f'{self.state}_govt_overlap_intx'
+        if arcpy.Exists(str(overlap_intx)):
+            self.logger.info("%s govt overlap intx already exists", self.state)
         else:
-            arcpy.analysis.Intersect([govt_false, self.govt_land], overlap_intx)
-            print(f'{self.state} govt overlap intx created')
+            arcpy.analysis.Intersect([govt_false, self.govt_land], str(overlap_intx))
+            self.logger.info("%s govt overlap intx created", self.state)
 
-        arcpy.management.AddField(overlap_intx, 'intx_ac', 'LONG')
-        arcpy.management.CalculateField(overlap_intx, "intx_ac", "!shape.area@acres!", "PYTHON3")
+        try:
+            arcpy.management.AddField(str(overlap_intx), 'intx_ac', 'LONG')
+        except arcpy.ExecuteError:
+            self.logger.debug("intx_ac field already exists")
+        arcpy.management.CalculateField(str(overlap_intx), 'intx_ac', '!shape.area@acres!', 'PYTHON3')
 
-
-        # erase overlaps over private
         private_intx = f"{self.state}_private_overlaps"
-        arcpy.MakeFeatureLayer_management(self.parcels, private_intx, where_clause="private_owner = 1 And private_centroid = 1")
+        arcpy.MakeFeatureLayer_management(
+            self.parcels, private_intx,
+            where_clause="private_owner = 1 And private_centroid = 1",
+        )
 
-        govt_land_private_erase = os.path.join(self.temp_dir, f'{self.state}_govt_land_private_erased')
-        if arcpy.Exists(govt_land_private_erase):
-            print(f'{self.state} govt private erase already exists')
+        govt_private_erase: Path = self.temp_dir / f'{self.state}_govt_land_private_erased'
+        if arcpy.Exists(str(govt_private_erase)):
+            self.logger.info("%s govt private erase already exists", self.state)
         else:
             arcpy.RepairGeometry_management(self.govt_land)
-            arcpy.analysis.Erase(self.govt_land, private_intx, govt_land_private_erase)
-            print(f'{self.state} govt private erase intx created')
+            arcpy.analysis.Erase(self.govt_land, private_intx, str(govt_private_erase))
+            self.logger.info("%s govt private erase created", self.state)
 
-        # erase overlap, gives ownership to govt where parcel has no owner and govt centroid
-        no_name_govt_intx = f"{self.state}_no_name_govt_intx"
-        arcpy.MakeFeatureLayer_management(overlap_intx, no_name_govt_intx, where_clause="full_name IN ('   ,    ') AND govt_centroid = 1")
+        def _make_overlap_layer(name: str, where: str) -> str:
+            arcpy.MakeFeatureLayer_management(str(overlap_intx), name, where_clause=where)
+            return name
 
-        parcel_no_name_govt_erase = os.path.join(self.temp_dir, f'{self.state}_parcels_erase_1')
-        if arcpy.Exists(parcel_no_name_govt_erase):
-            print(f'{self.state}_parcels_erase_1 already exists')
+        no_name_govt = _make_overlap_layer(
+            f"{self.state}_no_name_govt_intx",
+            f"full_name IN ('{NULL_OWNER_SENTINEL}') AND govt_centroid = 1",
+        )
+        erase_1: Path = self.temp_dir / f'{self.state}_parcels_erase_1'
+        if not arcpy.Exists(str(erase_1)):
+            arcpy.analysis.Erase(self.parcels, no_name_govt, str(erase_1))
+            self.logger.info("%s_parcels_erase_1 created", self.state)
+
+        sliver = _make_overlap_layer(
+            f"{self.state}_sliver_intx",
+            f"full_name IN ('{NULL_OWNER_SENTINEL}') AND intx_ac < {OVERLAP_SLIVER_THRESHOLD}",
+        )
+        govt_sliver_erase: Path = self.temp_dir / f'{self.state}_govt_land_private_erased_2'
+        if not arcpy.Exists(str(govt_sliver_erase)):
+            arcpy.analysis.Erase(str(govt_private_erase), sliver, str(govt_sliver_erase))
+            self.logger.info("%s govt overlap sliver erase created", self.state)
+
+        large_overlap = _make_overlap_layer(
+            f"{self.state}_large_overlap_intx",
+            f"full_name IN ('{NULL_OWNER_SENTINEL}') AND intx_ac >= {OVERLAP_SLIVER_THRESHOLD}",
+        )
+        erase_2: Path = self.temp_dir / f'{self.state}_parcels_erase_2'
+        if not arcpy.Exists(str(erase_2)):
+            arcpy.analysis.Erase(str(erase_1), large_overlap, str(erase_2))
+            self.logger.info("%s_parcels_erase_2 created", self.state)
+
+        govt_name_intx = _make_overlap_layer(
+            f"{self.state}_govt_name_intx",
+            f"govt_centroid = 1 And private_owner = 1 And intx_ac >= {OVERLAP_SLIVER_THRESHOLD}",
+        )
+        erase_3: Path = self.temp_dir / f'{self.state}_parcels_erase_3'
+        if not arcpy.Exists(str(erase_3)):
+            arcpy.analysis.Erase(str(erase_2), govt_name_intx, str(erase_3))
+            self.logger.info("%s_parcels_erase_3 created", self.state)
+
+        govt_centroid_intx = _make_overlap_layer(
+            f"{self.state}_govt_centroid_intx",
+            "govt_centroid = 1 And govt_owner = 1",
+        )
+        erase_4: Path = self.temp_dir / f'{self.state}_parcels_erase_4'
+        if not arcpy.Exists(str(erase_4)):
+            arcpy.analysis.Erase(str(erase_3), govt_centroid_intx, str(erase_4))
+            self.logger.info("%s_parcels_erase_4 created", self.state)
+
+        self.logger.info("Overlap QC complete for %s", self.state)
+
+    def qc_post_process(self) -> None:
+        """Delete all temp feature classes except the two final outputs."""
+        arcpy.env.workspace = str(self.temp_dir)
+        feature_classes = arcpy.ListFeatureClasses()
+
+        keep = {
+            f'{self.state}_parcels_erase_4',
+            f'{self.state}_govt_land_private_erased_2',
+        }
+        delete_list = [
+            str(self.temp_dir / fc)
+            for fc in feature_classes
+            if fc not in keep
+        ]
+
+        if delete_list:
+            arcpy.Delete_management(delete_list)
+            self.logger.info("Cleaned up %d temp feature classes", len(delete_list))
         else:
-            arcpy.analysis.Erase(self.parcels, no_name_govt_intx, parcel_no_name_govt_erase)
-            print(f'{self.state}_parcels_erase_1 created')
-
-        # erase slivers in no name private polygons
-        private_overlap_sliver_intx = f"{self.state}_private_overlap_sliver_intx"
-        arcpy.MakeFeatureLayer_management(overlap_intx, private_overlap_sliver_intx, where_clause="full_name IN ('   ,    ') AND intx_ac < 25")
-
-
-        govt_overlap_sliver_erase = os.path.join(self.temp_dir, f'{self.state}_govt_land_private_erased_2')
-        if arcpy.Exists(govt_overlap_sliver_erase):
-            print(f'{self.state} govt overlap sliver erase already exists')
-        else:
-            arcpy.analysis.Erase(govt_land_private_erase, private_overlap_sliver_intx, govt_overlap_sliver_erase)
-            print(f'{self.state} govt overlap sliver erase created')
-
-        # erase govt overlap where there is legit govt
-        private_overlap_govt_intx = f"{self.state}_private_overlap_govt_intx"
-        arcpy.MakeFeatureLayer_management(overlap_intx, private_overlap_govt_intx, where_clause="full_name IN ('   ,    ') AND intx_ac >= 25")
-
-        private_overlap_govt_intx_erase = os.path.join(self.temp_dir, f'{self.state}_parcels_erase_2')
-        if arcpy.Exists(private_overlap_govt_intx_erase):
-            print(f'{self.state} private overlap govt intx erase erase already exists')
-        else:
-            arcpy.analysis.Erase(parcel_no_name_govt_erase, private_overlap_govt_intx, private_overlap_govt_intx_erase)
-            print(f'{self.state} private overlap govt intx erase created')
-
-
-        # erase real govt from private name land
-        govt_land_private_name_intx = f"{self.state}_govt_land_private_name_intx"
-        arcpy.MakeFeatureLayer_management(overlap_intx, govt_land_private_name_intx, where_clause="govt_centroid = 1 And private_owner = 1 And intx_ac >= 25")
-
-        private_land_govt_intx = os.path.join(self.temp_dir, f'{self.state}_parcels_erase_3')
-        if arcpy.Exists(private_land_govt_intx):
-            print(f'{self.state} govt land private name intx already exists')
-        else:
-            arcpy.analysis.Erase(private_overlap_govt_intx_erase, govt_land_private_name_intx, private_land_govt_intx)
-            print(f'{self.state} private overlap govt intx erase created')
-
-        # erase from private where intx is govt centroid and govt name is 1
-        govt_name_centroid_intx = f"{self.state}_govt_name_centroid_intx"
-        arcpy.MakeFeatureLayer_management(overlap_intx, govt_name_centroid_intx, where_clause="govt_centroid = 1 And govt_owner = 1")
-
-        private_land_govt_overlap_erased = os.path.join(self.temp_dir, f'{self.state}_parcels_erase_4')
-        if arcpy.Exists(private_land_govt_overlap_erased):
-            print(f'{self.state} private land govt overlap erased already exists')
-        else:
-            arcpy.analysis.Erase(private_land_govt_intx, govt_name_centroid_intx, private_land_govt_overlap_erased)
-            print(f'{self.state} private land govt overlap erased created')
-
-    def qc_post_process(self):
-        arcpy.env.workspace = self.temp_dir
-
-        featureclasses = arcpy.ListFeatureClasses()
-
-        #TODO update state_parcels_erase_4 to only the columns needed for the dissolve
-
-        state_private = f'{self.state}_parcels_erase_4'
-        state_govt = f'{self.state}_govt_land_private_erased_2'
-
-        featureclasses.remove(state_private)
-        featureclasses.remove(state_govt)
-
-        delete_list = []
-        for fc in featureclasses:
-            full_path = os.path.join(self.temp_dir, fc)
-            delete_list.append(full_path)
-
-        arcpy.Delete_management(delete_list)
+            self.logger.info("No temp feature classes to clean up")
