@@ -1,4 +1,5 @@
 """Shared geospatial utility functions used across PLR pipeline modules."""
+import os
 import time
 import logging
 from pathlib import Path
@@ -7,7 +8,17 @@ import arcpy
 
 
 def get_quarter() -> str:
-    """Return the current calendar quarter string, e.g. 'Q2_2026'."""
+    """
+    Return the active quarter string, e.g. 'Q2_2026'.
+
+    If the environment variable ``PLR_QUARTER`` is set (e.g. via
+    ``--quarter`` on the CLI) that value is returned as-is, allowing
+    operators to reprocess a specific quarter without touching the clock.
+    """
+    override = os.environ.get('PLR_QUARTER', '').strip()
+    if override:
+        return override
+
     month = time.strftime("%m")
     year = time.strftime("%Y")
     if month in ('01', '02', '03'):

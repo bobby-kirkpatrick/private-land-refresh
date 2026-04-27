@@ -71,3 +71,26 @@ class BaseModel:
             'Final workspace',
         )
         self.logger.debug("set_workspaces elapsed: %.1fs", self._elapsed())
+
+    # ------------------------------------------------------------------
+    # Geometry repair
+    # ------------------------------------------------------------------
+
+    def repair_geometry(self) -> None:
+        """
+        Run RepairGeometry on both the parcel and government land feature
+        classes before any processing begins.
+
+        Centralising this here ensures geometry is always clean at pipeline
+        entry, rather than only inside overlap_qc where problems surface late.
+        """
+        for fc, label in [(self.parcels, 'parcels'), (self.govt_land, 'govt land')]:
+            if arcpy.Exists(fc):
+                self.logger.info("Repairing geometry: %s %s", self.state, label)
+                arcpy.RepairGeometry_management(fc)
+                self.logger.info("Geometry repair complete: %s %s", self.state, label)
+            else:
+                self.logger.warning(
+                    "Skipping geometry repair — %s %s not found: %s",
+                    self.state, label, fc,
+                )

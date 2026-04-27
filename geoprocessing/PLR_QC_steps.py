@@ -3,35 +3,45 @@ from pathlib import Path
 import arcpy
 
 from configs.settings import (
-    GOVT_OVERLAP_THRESHOLD,
     GAP_ACRE_THRESHOLD,
     OVERLAP_SLIVER_THRESHOLD,
-    QC_LARGE_PARCEL_THRESHOLD,
     NULL_OWNER_SENTINEL,
 )
 from geoprocessing.base_model import BaseModel
+from utils.qc_rules import apply_qc_rule
 
 
 class PLR_QC_model(BaseModel):
     """Quality-control stage that reconciles XGBoost vs GIS model disagreements."""
 
     def qc_counts(self) -> None:
-        """Log parcel counts and model agreement rates."""
-        parcel_count = int(arcpy.GetCount_management(self.parcels)[0])
-        self.logger.info("%s: %d total parcels", self.state, parcel_count)
+        """
+        Log parcel counts and model agreement rates.
+
+        Stores results as instance attributes so ``main.py`` can pick them
+        up for the run report without re-querying the feature class:
+          - ``self.parcel_count``
+          - ``self.agreement_count``
+          - ``self.agreement_pct``
+        """
+        self.parcel_count: int = int(arcpy.GetCount_management(self.parcels)[0])
+        self.logger.info("%s: %d total parcels", self.state, self.parcel_count)
 
         agreement_layer = arcpy.SelectLayerByAttribute_management(
             self.parcels, "NEW_SELECTION", '"gh_govt" = "xgb_gh_govt"'
         )
-        agreement_count = int(arcpy.GetCount_management(agreement_layer)[0])
-        agreement_pct = (agreement_count / parcel_count * 100) if parcel_count else 0
+        self.agreement_count: int = int(arcpy.GetCount_management(agreement_layer)[0])
+        self.agreement_pct: float = (
+            self.agreement_count / self.parcel_count * 100 if self.parcel_count else 0.0
+        )
 
         self.logger.info(
             "%s model agreement: %d / %d parcels (%.1f%%)",
-            self.state, agreement_count, parcel_count, agreement_pct,
+            self.state, self.agreement_count, self.parcel_count, self.agreement_pct,
         )
         self.logger.info(
-            "%s: %d parcels require QC", self.state, parcel_count - agreement_count
+            "%s: %d parcels require QC",
+            self.state, self.parcel_count - self.agreement_count,
         )
 
     def label_qc(self) -> None:
@@ -58,20 +68,10 @@ class PLR_QC_model(BaseModel):
         with arcpy.da.UpdateCursor(self.parcels, qc_fields) as cursor:
             for row in cursor:
                 gh, xgb, priv_own, acres, qc, name, overlap, govt_cen, govt_own = row
-
-                if xgb == 'FALSE' and gh == 'TRUE' and priv_own == 1 and acres >= QC_LARGE_PARCEL_THRESHOLD and qc == 1:
-                    row[0], row[4] = 'TRUE', 2
-                elif xgb == 'FALSE' and gh == 'TRUE' and priv_own == 1 and acres < QC_LARGE_PARCEL_THRESHOLD and qc == 1:
-                    row[0], row[4] = 'FALSE', 3
-                elif qc == 1 and name == NULL_OWNER_SENTINEL and overlap >= GOVT_OVERLAP_THRESHOLD:
-                    row[0], row[4] = 'TRUE', 4
-                elif qc == 1 and name == NULL_OWNER_SENTINEL and overlap < GOVT_OVERLAP_THRESHOLD:
-                    row[0], row[4] = 'UNKNOWN', 5
-                elif qc == 1 and govt_cen == 1 and govt_own == 1:
-                    row[0], row[4] = 'TRUE', 6
-                elif qc == 1:
-                    row[4] = 7
-
+                new_gh, new_qc = apply_qc_rule(
+                    gh, xgb, priv_own, acres, qc, name, overlap, govt_cen, govt_own
+                )
+                row[0], row[4] = new_gh, new_qc
                 cursor.updateRow(row)
 
         self.logger.info("Label QC complete for %s", self.state)
