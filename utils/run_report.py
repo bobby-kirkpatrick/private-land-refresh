@@ -25,6 +25,11 @@ class StateResult:
     parcel_count: int = 0
     agreement_count: int = 0
     agreement_pct: float = 0.0
+    # Final gh_govt label distribution (populated after QC stage)
+    true_count: int = 0
+    false_count: int = 0
+    unknown_count: int = 0
+    qc_flag_counts: dict[str, int] = field(default_factory=dict)
     elapsed_seconds: float = 0.0
     failed_stages: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -124,6 +129,18 @@ class RunReport:
                 f"{r.agreement_pct:.1f}% agreement | "
                 f"{r.elapsed_seconds:.1f}s"
             )
+            if r.true_count or r.false_count or r.unknown_count:
+                total = r.true_count + r.false_count + r.unknown_count or 1
+                lines.append(
+                    f"      Labels  : TRUE={r.true_count:,} ({r.true_count/total*100:.1f}%)  "
+                    f"FALSE={r.false_count:,} ({r.false_count/total*100:.1f}%)  "
+                    f"UNKNOWN={r.unknown_count:,} ({r.unknown_count/total*100:.1f}%)"
+                )
+            if r.qc_flag_counts:
+                flag_str = '  '.join(
+                    f"flag{k}={v:,}" for k, v in sorted(r.qc_flag_counts.items())
+                )
+                lines.append(f"      QC flags: {flag_str}")
             for err in r.errors:
                 lines.append(f"      ERROR: {err}")
         return lines

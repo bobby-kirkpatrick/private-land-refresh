@@ -76,6 +76,47 @@ class PLR_QC_model(BaseModel):
 
         self.logger.info("Label QC complete for %s", self.state)
 
+    def classification_counts(self) -> None:
+        """
+        Count the final ``gh_govt`` label distribution and QC flag breakdown.
+
+        Must be called after :meth:`label_qc`.  Results are stored as instance
+        attributes so ``main.py`` can harvest them for the run report:
+
+          - ``self.true_count``
+          - ``self.false_count``
+          - ``self.unknown_count``
+          - ``self.qc_flag_counts``  — ``{str(flag): count}`` for each flag value
+        """
+        self.true_count = 0
+        self.false_count = 0
+        self.unknown_count = 0
+        self.qc_flag_counts: dict[str, int] = {}
+
+        with arcpy.da.SearchCursor(self.parcels, ['gh_govt', 'qc']) as cursor:
+            for row in cursor:
+                gh_val, qc_val = row
+                if gh_val == 'TRUE':
+                    self.true_count += 1
+                elif gh_val == 'FALSE':
+                    self.false_count += 1
+                elif gh_val == 'UNKNOWN':
+                    self.unknown_count += 1
+
+                if qc_val is not None:
+                    key = str(int(qc_val))
+                    self.qc_flag_counts[key] = self.qc_flag_counts.get(key, 0) + 1
+
+        total = self.true_count + self.false_count + self.unknown_count or 1
+        self.logger.info(
+            "%s label distribution: TRUE=%d (%.1f%%)  FALSE=%d (%.1f%%)  UNKNOWN=%d (%.1f%%)",
+            self.state,
+            self.true_count,  self.true_count  / total * 100,
+            self.false_count, self.false_count / total * 100,
+            self.unknown_count, self.unknown_count / total * 100,
+        )
+        self.logger.info("%s QC flag distribution: %s", self.state, self.qc_flag_counts)
+
     def gap_qc(self) -> None:
         """Identify and insert gap features between govt-labelled parcels and the govt layer."""
         govt_true = f"{self.state}_GovtTrue"
@@ -160,7 +201,6 @@ class PLR_QC_model(BaseModel):
         if arcpy.Exists(str(govt_private_erase)):
             self.logger.info("%s govt private erase already exists", self.state)
         else:
-            arcpy.RepairGeometry_management(self.govt_land)
             arcpy.analysis.Erase(self.govt_land, private_intx, str(govt_private_erase))
             self.logger.info("%s govt private erase created", self.state)
 

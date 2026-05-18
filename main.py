@@ -111,6 +111,7 @@ def _run_qc(config: dict, results: dict) -> None:
             model.set_workspaces()
             model.qc_counts()
             model.label_qc()
+            model.classification_counts()
             model.gap_qc()
             model.overlap_qc()
             model.qc_post_process()
@@ -119,6 +120,10 @@ def _run_qc(config: dict, results: dict) -> None:
             result.parcel_count = model.parcel_count
             result.agreement_count = model.agreement_count
             result.agreement_pct = round(model.agreement_pct, 2)
+            result.true_count = model.true_count
+            result.false_count = model.false_count
+            result.unknown_count = model.unknown_count
+            result.qc_flag_counts = model.qc_flag_counts
 
             logger.info("--- QC: %s complete ---", state)
         except arcpy.ExecuteError:
