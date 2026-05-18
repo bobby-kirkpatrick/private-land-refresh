@@ -72,8 +72,8 @@ def _check_fields(
     """Return error strings for any required fields absent from *path*."""
     if not arcpy.Exists(path):
         return []  # already caught by _check_fc_exists
-    existing = {f.name for f in arcpy.ListFields(path)}
-    missing = sorted(f for f in required if f not in existing)
+    existing = {f.name.upper() for f in arcpy.ListFields(path)}
+    missing = sorted(f for f in required if f.upper() not in existing)
     if missing:
         msg = f"[MISSING FIELDS] {label}: {missing}"
         logger.error(msg)
