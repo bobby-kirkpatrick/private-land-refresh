@@ -172,7 +172,8 @@ class PLR_xgboost_model(BaseModel):
         y_preds = xgb_model.predict(x_df)
         pred_df = pd.DataFrame(y_preds, columns=['gh_govt_codes'])
         final_df = x_df.join(pred_df)
-        final_df['gh_govt_xgboost'] = final_df['gh_govt_codes'].map({0: 'FALSE', 1: 'TRUE'})
+        # Reverse of the training encoding: {'FALSE': 1, 'TRUE': 2, 'UNKNOWN': 3}
+        final_df['gh_govt_xgboost'] = final_df['gh_govt_codes'].map({1: 'FALSE', 2: 'TRUE', 3: 'UNKNOWN'})
         final_df.drop(
             columns=[
                 'overlap_perc', 'govt_centroid', 'private_centroid',

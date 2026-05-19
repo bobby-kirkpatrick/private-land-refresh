@@ -64,8 +64,8 @@ def apply_qc_rule(
     7   Unresolved disagreement          → label unchanged, flag set to 7.
     """
     if qc != 1:
-        # Row is in model agreement — nothing to resolve
-        return gh, qc
+        # Row is in model agreement — nothing to resolve; normalise to 0
+        return gh, 0
 
     # Rule 2: XGB says private, GIS says govt, large private-named parcel → keep govt
     if xgb == 'FALSE' and gh == 'TRUE' and priv_own == 1 and acres >= QC_LARGE_PARCEL_THRESHOLD:
