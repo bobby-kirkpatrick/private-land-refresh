@@ -15,6 +15,12 @@ Usage examples
 # Reprocess a previous quarter in a custom workspace:
     python main.py --states OH --quarter Q1_2026 --workspace D:\\output\\q1
 
+# Run only the QC and post-process stages (XGBoost + GIS already done):
+    python main.py --states CO --stages qc post_process
+
+# Re-run just post-process after fixing an output issue:
+    python main.py --states CO --stages post_process
+
 # Combine flags:
     python main.py --states OH CA --dry-run --quarter Q2_2026
 """
@@ -212,6 +218,17 @@ def _build_parser() -> argparse.ArgumentParser:
         '--dry-run', action='store_true',
         help='Validate inputs and exit without processing.',
     )
+    parser.add_argument(
+        '--stages', nargs='+',
+        choices=['xgboost', 'gis', 'qc', 'post_process'],
+        metavar='STAGE',
+        help=(
+            'Run only the specified stage(s). '
+            'Choices: xgboost gis qc post_process. '
+            'Useful for re-running later stages when earlier GDBs already exist. '
+            'Example: --stages qc post_process'
+        ),
+    )
     return parser
 
 
@@ -235,6 +252,13 @@ def main(config: dict, args: argparse.Namespace | None = None) -> None:
         config = _filter_states(config, [s.upper() for s in args.states])
 
     dry_run = args is not None and args.dry_run
+
+    _ALL_STAGES = ('xgboost', 'gis', 'qc', 'post_process')
+    active_stages: frozenset[str] = (
+        frozenset(args.stages) if args is not None and args.stages
+        else frozenset(_ALL_STAGES)
+    )
+
     quarter = get_quarter()
 
     # --- Initialise run report ---
@@ -250,8 +274,9 @@ def main(config: dict, args: argparse.Namespace | None = None) -> None:
 
     logger.info("====== PLR pipeline started ======")
     logger.info(
-        "States: %s | Quarter: %s | Dry-run: %s",
+        "States: %s | Quarter: %s | Dry-run: %s | Stages: %s",
         list(config['states'].keys()), quarter, dry_run,
+        sorted(active_stages),
     )
 
     # --- Pre-flight validation ---
@@ -268,17 +293,29 @@ def main(config: dict, args: argparse.Namespace | None = None) -> None:
         return
 
     # --- Pipeline stages ---
-    logger.info("Stage 1/4: XGBoost model predictions")
-    _run_xgboost(config, results)
+    if 'xgboost' in active_stages:
+        logger.info("Stage xgboost: XGBoost model predictions")
+        _run_xgboost(config, results)
+    else:
+        logger.info("Stage xgboost: skipped (not in --stages)")
 
-    logger.info("Stage 2/4: GIS model predictions")
-    _run_gis_model(config, results)
+    if 'gis' in active_stages:
+        logger.info("Stage gis: GIS model predictions")
+        _run_gis_model(config, results)
+    else:
+        logger.info("Stage gis: skipped (not in --stages)")
 
-    logger.info("Stage 3/4: QC process")
-    _run_qc(config, results)
+    if 'qc' in active_stages:
+        logger.info("Stage qc: QC process")
+        _run_qc(config, results)
+    else:
+        logger.info("Stage qc: skipped (not in --stages)")
 
-    logger.info("Stage 4/4: Post-processing")
-    _run_post_process(config, results)
+    if 'post_process' in active_stages:
+        logger.info("Stage post_process: Post-processing")
+        _run_post_process(config, results)
+    else:
+        logger.info("Stage post_process: skipped (not in --stages)")
 
     # --- Finalise and write run report ---
     total_elapsed = time.time() - pipeline_start

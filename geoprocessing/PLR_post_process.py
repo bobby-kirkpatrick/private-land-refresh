@@ -141,6 +141,9 @@ class PLR_post_process:
     def multipart_to_singlepart(self) -> None:
         """Convert dissolved multipart private land to single-part and calculate acreage."""
         final_private: Path = self.final / f'{self.state}_Private_Land_{self.quarter}'
+        if arcpy.Exists(str(final_private)):
+            arcpy.Delete_management(str(final_private))
+            logger.info("Deleted existing %s_Private_Land_%s for recreation", self.state, self.quarter)
         arcpy.MultipartToSinglepart_management(str(self.dissolve_output), str(final_private))
         arcpy.management.AddField(str(final_private), 'gh_parcel_acres', 'DOUBLE')
         arcpy.management.CalculateField(str(final_private), 'gh_parcel_acres', '!shape.area@acres!', 'PYTHON3')
