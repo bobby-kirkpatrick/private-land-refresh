@@ -27,14 +27,14 @@ class PLR_GIS_model(BaseModel):
             ['OBJECTID', 'gh_govt', 'gh_govtype', 'unit_nm', 'overlap_perc'],
         ) as cursor:
             for row in cursor:
-                if row[0] in govt_intx_dict:
+                centroid_in_govt = row[0] in govt_intx_dict
+                high_overlap = row[4] is not None and row[4] >= GOVT_OVERLAP_THRESHOLD
+
+                if centroid_in_govt:
                     row[2] = govt_intx_dict[row[0]][0]
                     row[3] = govt_intx_dict[row[0]][1]
-                    row[1] = 'TRUE'
-                if row[4] >= GOVT_OVERLAP_THRESHOLD:
-                    row[1] = 'TRUE'
-                else:
-                    row[1] = 'FALSE'
+
+                row[1] = 'TRUE' if centroid_in_govt or high_overlap else 'FALSE'
                 cursor.updateRow(row)
 
         self.logger.info("%s private land labelled", self.state)
