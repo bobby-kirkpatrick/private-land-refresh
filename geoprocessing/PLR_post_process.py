@@ -93,9 +93,15 @@ class PLR_post_process:
         """Dissolve named private parcels by owner and address fields."""
         arcpy.env.parallelProcessingFactor = PARALLEL_PROCESSING_FACTOR
 
+        # Use a state-prefixed layer name so concurrent or sequential state runs
+        # cannot collide on the same in-memory layer name.
+        lyr_name = f'{self.state}_private_parcels'
+        if arcpy.Exists(lyr_name):
+            arcpy.Delete_management(lyr_name)
+
         arcpy.MakeFeatureLayer_management(
             str(self.parcels_dissolve_prep),
-            'private_parcels',
+            lyr_name,
             where_clause=(
                 "gh_govt = 'FALSE' And "
                 "(OWN1_LAST <> ' ' Or OWN1_FRST <> ' ' Or "
@@ -105,37 +111,61 @@ class PLR_post_process:
 
         private_parcels_fc: Path = self.temp / 'private_parcels'
         if not arcpy.Exists(str(private_parcels_fc)):
-            arcpy.CopyFeatures_management('private_parcels', str(private_parcels_fc))
+            arcpy.CopyFeatures_management(lyr_name, str(private_parcels_fc))
 
         self.dissolve_output: Path = self.temp / f'{self.state}_private_dissolved_named'
         if arcpy.Exists(str(self.dissolve_output)):
             logger.info("%s_private_dissolved_named already exists", self.state)
         else:
-            arcpy.gapro.DissolveBoundaries(
-                input_layer=str(private_parcels_fc),
-                out_feature_class=str(self.dissolve_output),
-                multipart='MULTI_PART',
-                dissolve_fields='DISSOLVE_FIELDS',
-                fields=['OWN1_LAST', 'OWN1_FRST', 'OWN2_LAST', 'OWN2_FRST',
-                        'MAIL_ADDR', 'MAIL_ZIP', 'MAIL_STATE', 'MAIL_CITY'],
-            )
-            logger.info("%s_private_dissolved_named created", self.state)
+            # Pass the in-memory layer (not a path string) to gapro — GeoAnalytics
+            # tools expect a feature layer and can fail with ERROR 001409 when given
+            # a file path string.  Falls back to management.Dissolve if gapro is
+            # unavailable or fails in the current environment.
+            try:
+                arcpy.gapro.DissolveBoundaries(
+                    input_layer=lyr_name,
+                    out_feature_class=str(self.dissolve_output),
+                    multipart='MULTI_PART',
+                    dissolve_fields='DISSOLVE_FIELDS',
+                    fields=['OWN1_LAST', 'OWN1_FRST', 'OWN2_LAST', 'OWN2_FRST',
+                            'MAIL_ADDR', 'MAIL_ZIP', 'MAIL_STATE', 'MAIL_CITY'],
+                )
+                logger.info("%s_private_dissolved_named created (GeoAnalytics)", self.state)
+            except arcpy.ExecuteError:
+                gapro_msg = arcpy.GetMessages(2)
+                logger.warning(
+                    "GeoAnalytics DissolveBoundaries failed for %s (%s) — "
+                    "falling back to standard Dissolve",
+                    self.state, gapro_msg.splitlines()[0],
+                )
+                arcpy.management.Dissolve(
+                    in_features=lyr_name,
+                    out_feature_class=str(self.dissolve_output),
+                    dissolve_field=['OWN1_LAST', 'OWN1_FRST', 'OWN2_LAST', 'OWN2_FRST',
+                                    'MAIL_ADDR', 'MAIL_ZIP', 'MAIL_STATE', 'MAIL_CITY'],
+                    multi_part='MULTI_PART',
+                )
+                logger.info("%s_private_dissolved_named created (standard Dissolve)", self.state)
 
-        arcpy.Delete_management('private_parcels')
+        arcpy.Delete_management(lyr_name)
 
     def append_private_no_owner_parcels(self) -> None:
         """Append no-owner private parcels to the dissolved output."""
+        lyr_name = f'{self.state}_no_owner_private_parcels'
+        if arcpy.Exists(lyr_name):
+            arcpy.Delete_management(lyr_name)
+
         arcpy.MakeFeatureLayer_management(
             str(self.parcels_dissolve_prep),
-            'no_owner_private_parcels',
+            lyr_name,
             where_clause=(
                 "gh_govt = 'FALSE' And "
                 "(OWN1_LAST = ' ' AND OWN1_FRST = ' ' AND "
                 "OWN2_LAST = ' ' AND OWN2_FRST = ' ' AND mail_addr = '')"
             ),
         )
-        arcpy.Append_management('no_owner_private_parcels', str(self.dissolve_output), 'NO_TEST')
-        arcpy.Delete_management('no_owner_private_parcels')
+        arcpy.Append_management(lyr_name, str(self.dissolve_output), 'NO_TEST')
+        arcpy.Delete_management(lyr_name)
         logger.info("No-owner parcels appended for %s", self.state)
 
     def multipart_to_singlepart(self) -> None:

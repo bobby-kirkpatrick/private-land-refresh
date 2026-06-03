@@ -1,3 +1,4 @@
+import json
 import pandas as pd
 import arcpy
 from arcgis.features import GeoAccessor, GeoSeriesAccessor
@@ -7,6 +8,18 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from xgboost import XGBClassifier
 from collections import Counter
+
+# NOTE: encoding to clean up at next refactor ─────────────────────────────────
+# Current encoding maps FALSE→1, TRUE→2, UNKNOWN→3.  The UNKNOWN filter on
+# line 310 is a no-op because gh_govt has already been mapped to integers by
+# that point, so UNKNOWN rows (value 3) remain in training as a third class.
+# Plan: change to {FALSE: 0, TRUE: 1}, properly filter UNKNOWN rows BEFORE
+# encoding, and update _DEFAULT_INVERSE_LABEL_MAP in PLR_xgboost_model_predictions.py
+# at the same time.  Both files must be changed together; do not change one
+# without the other.
+# ─────────────────────────────────────────────────────────────────────────────
+_LABEL_MAP = {'FALSE': 1, 'TRUE': 2, 'UNKNOWN': 3}
+_INVERSE_LABEL_MAP = {str(v): k for k, v in _LABEL_MAP.items()}  # {'1':'FALSE','2':'TRUE','3':'UNKNOWN'}
 
 print('imports done')
 
@@ -334,7 +347,22 @@ class PLR_xgboost_model_training:
         print("model accuracy: {}%".format(accuracy * 100))
 
         # save xgb model
-        xgb_model.save_model(os.path.join(r'D:\private-land-refresh\private-land-refresh', 'state_xgb_models', '{}_xgb_model.json'.format(self.state)))
+        model_dir = os.path.join(r'D:\private-land-refresh\private-land-refresh', 'state_xgb_models')
+        model_path = os.path.join(model_dir, '{}_xgb_model.json'.format(self.state))
+        xgb_model.save_model(model_path)
+
+        # save companion metadata so prediction code never has to guess the encoding
+        metadata = {
+            'state': self.state,
+            'trained_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'label_map': _LABEL_MAP,
+            'inverse_label_map': _INVERSE_LABEL_MAP,
+            'feature_cols': cols,
+        }
+        meta_path = os.path.join(model_dir, '{}_xgb_model.meta.json'.format(self.state))
+        with open(meta_path, 'w', encoding='utf-8') as fh:
+            json.dump(metadata, fh, indent=2)
+        print('Model and metadata saved to {}'.format(model_dir))
 
         return state_df
 

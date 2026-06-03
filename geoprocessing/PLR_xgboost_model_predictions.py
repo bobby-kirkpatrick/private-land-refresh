@@ -1,4 +1,5 @@
 import csv
+import json
 from pathlib import Path
 
 import arcpy
@@ -9,6 +10,61 @@ from xgboost import XGBClassifier
 from configs.settings import GOVT_NAME_TABLES_DIR, XGB_MODELS_DIR, NULL_OWNER_SENTINEL
 from geoprocessing.base_model import BaseModel
 from utils.geo_utils import build_centroid_govt_intersect
+
+# Fallback decode map used when no .meta.json file exists alongside the model.
+# Matches the encoding used in PLR_xgboost_model_training.train_model():
+#   state_df['gh_govt'].map({'FALSE': 1, 'TRUE': 2, 'UNKNOWN': 3})
+_DEFAULT_INVERSE_LABEL_MAP: dict[int, str] = {1: 'FALSE', 2: 'TRUE', 3: 'UNKNOWN'}
+
+# XGBoost 1.x stored certain boolean parameters as integers (0/1) in the model
+# JSON.  XGBoost 2.x strictly requires boolean types and raises
+# "Invalid cast, from Integer to Boolean" when loading those older files.
+# This list covers the known offending fields.
+_XGB_LEGACY_BOOL_FIELDS = ['use_label_encoder']
+
+
+def _load_xgb_model(model_path: Path, logger) -> 'XGBClassifier':
+    """
+    Load an XGBoost model, patching integer-to-boolean type incompatibilities
+    that arise when a model trained with XGBoost 1.x is loaded under 2.x.
+
+    If the standard load succeeds the patching is skipped entirely.
+    A patched copy is written alongside the original as
+    ``<name>_compat.json`` so subsequent loads are fast.
+    """
+    import re
+
+    xgb_model = XGBClassifier()
+    try:
+        xgb_model.load_model(str(model_path))
+        return xgb_model
+    except Exception as exc:
+        if 'Invalid cast' not in str(exc) and 'Boolean' not in str(exc):
+            raise  # unrelated error — propagate as-is
+
+    logger.warning(
+        "Model %s appears to have been saved with an older XGBoost version "
+        "(Integer→Boolean cast error).  Attempting compatibility patch…",
+        model_path.name,
+    )
+
+    compat_path = model_path.with_name(model_path.stem + '_compat.json')
+
+    if not compat_path.exists():
+        with open(model_path, 'r', encoding='utf-8') as fh:
+            raw = fh.read()
+        for field in _XGB_LEGACY_BOOL_FIELDS:
+            raw = re.sub(rf'("{re.escape(field)}"\s*:\s*)0\b', r'\g<1>false', raw)
+            raw = re.sub(rf'("{re.escape(field)}"\s*:\s*)1\b', r'\g<1>true', raw)
+        with open(compat_path, 'w', encoding='utf-8') as fh:
+            fh.write(raw)
+        logger.info("Patched model written to %s", compat_path.name)
+    else:
+        logger.info("Using existing patched model %s", compat_path.name)
+
+    xgb_model.load_model(str(compat_path))
+    logger.info("Model loaded successfully via compatibility patch")
+    return xgb_model
 
 
 class PLR_xgboost_model(BaseModel):
@@ -165,15 +221,32 @@ class PLR_xgboost_model(BaseModel):
         if not model_path.exists():
             raise FileNotFoundError(f"XGBoost model not found: {model_path}")
 
+        # Load label decode map from companion metadata file if it exists;
+        # fall back to the hard-coded default for models trained before metadata
+        # persistence was added.
+        meta_path: Path = model_path.with_suffix('.meta.json')
+        if meta_path.exists():
+            with open(meta_path, encoding='utf-8') as fh:
+                meta = json.load(fh)
+            inverse_label_map: dict[int, str] = {
+                int(k): v for k, v in meta['inverse_label_map'].items()
+            }
+            self.logger.info("Loaded model metadata from %s", meta_path.name)
+        else:
+            inverse_label_map = _DEFAULT_INVERSE_LABEL_MAP
+            self.logger.warning(
+                "No metadata file found for %s model (%s); "
+                "using default label encoding %s",
+                self.state, meta_path.name, inverse_label_map,
+            )
+
         self.logger.info("Loading XGBoost model from %s", model_path)
-        xgb_model = XGBClassifier()
-        xgb_model.load_model(str(model_path))
+        xgb_model = _load_xgb_model(model_path, self.logger)
 
         y_preds = xgb_model.predict(x_df)
         pred_df = pd.DataFrame(y_preds, columns=['gh_govt_codes'])
         final_df = x_df.join(pred_df)
-        # Reverse of the training encoding: {'FALSE': 1, 'TRUE': 2, 'UNKNOWN': 3}
-        final_df['gh_govt_xgboost'] = final_df['gh_govt_codes'].map({1: 'FALSE', 2: 'TRUE', 3: 'UNKNOWN'})
+        final_df['gh_govt_xgboost'] = final_df['gh_govt_codes'].map(inverse_label_map)
         final_df.drop(
             columns=[
                 'overlap_perc', 'govt_centroid', 'private_centroid',
