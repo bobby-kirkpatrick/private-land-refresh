@@ -21,15 +21,21 @@ Usage examples
 # Re-run just post-process after fixing an output issue:
     python main.py --states CO --stages post_process
 
+# Process 3 states in parallel (requires ArcGIS Pro Advanced license):
+    python main.py --states CO MT OK SD --max-workers 3
+
 # Combine flags:
     python main.py --states OH CA --dry-run --quarter Q2_2026
 """
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import fields as dataclass_fields
 
 import arcpy
 
@@ -192,6 +198,75 @@ def _filter_states(config: dict, requested: list[str]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Parallel worker
+# ---------------------------------------------------------------------------
+
+def _process_state(args: tuple) -> StateResult:
+    """
+    Worker process entry point — runs all active pipeline stages for one state.
+
+    Must be a module-level function (not a lambda or nested function) so that
+    Python's multiprocessing 'spawn' start method (used on Windows) can
+    pickle and transmit it to the child process.
+
+    Each worker process re-imports this module, which re-executes
+    ``import arcpy`` and ``arcpy.env.parallelProcessingFactor = ...`` in
+    isolation, giving every state its own fully independent arcpy session.
+    """
+    abbr, data, active_stages_list = args
+    active_stages = frozenset(active_stages_list)
+
+    # ------------------------------------------------------------------ #
+    # Worker logging — replace handlers inherited from module-level setup #
+    # to avoid RotatingFileHandler write-lock conflicts on Windows.       #
+    # Workers log to a per-state file; the main process log captures the  #
+    # high-level start/complete/error events.                             #
+    # ------------------------------------------------------------------ #
+    from configs.settings import LOG_DIR
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    _fmt = logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+    _log_file = LOG_DIR / f'plr_{abbr.lower()}_{time.strftime("%Y%m%d_%H%M%S")}.log'
+    _fh = logging.FileHandler(str(_log_file), encoding='utf-8')
+    _fh.setFormatter(_fmt)
+    _sh = logging.StreamHandler()
+    _sh.setFormatter(logging.Formatter(
+        f'[{abbr}] %(asctime)s | %(levelname)-8s | %(message)s',
+        datefmt='%H:%M:%S',
+    ))
+
+    # Clear every handler that was set up during module import so we don't
+    # also write to the main process's rotating log file.
+    for _lgr in list(logging.Logger.manager.loggerDict.values()):
+        if isinstance(_lgr, logging.Logger):
+            _lgr.handlers.clear()
+            _lgr.propagate = True
+    logging.root.handlers = [_fh, _sh]
+    logging.root.setLevel(logging.INFO)
+
+    # ------------------------------------------------------------------ #
+    # Run stages                                                          #
+    # ------------------------------------------------------------------ #
+    result = StateResult(abbr=abbr, state=state_full[abbr])
+    single_config = {'states': {abbr: data}}
+    results_dict: dict[str, StateResult] = {abbr: result}
+
+    if 'xgboost' in active_stages:
+        _run_xgboost(single_config, results_dict)
+    if 'gis' in active_stages:
+        _run_gis_model(single_config, results_dict)
+    if 'qc' in active_stages:
+        _run_qc(single_config, results_dict)
+    if 'post_process' in active_stages:
+        _run_post_process(single_config, results_dict)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # CLI argument parser
 # ---------------------------------------------------------------------------
 
@@ -229,6 +304,16 @@ def _build_parser() -> argparse.ArgumentParser:
             'Example: --stages qc post_process'
         ),
     )
+    parser.add_argument(
+        '--max-workers', type=int, default=1, metavar='N',
+        help=(
+            'Number of states to process in parallel (default: 1 = sequential). '
+            '2-4 is recommended. Each worker is a separate process with its own '
+            'arcpy session. Requires ArcGIS Pro Advanced license and sufficient '
+            'RAM (~8-12 GB per concurrent state). Each state writes its own log '
+            'file under the logs directory when running in parallel.'
+        ),
+    )
     return parser
 
 
@@ -252,6 +337,7 @@ def main(config: dict, args: argparse.Namespace | None = None) -> None:
         config = _filter_states(config, [s.upper() for s in args.states])
 
     dry_run = args is not None and args.dry_run
+    max_workers: int = args.max_workers if args is not None and hasattr(args, 'max_workers') else 1
 
     _ALL_STAGES = ('xgboost', 'gis', 'qc', 'post_process')
     active_stages: frozenset[str] = (
@@ -274,9 +360,9 @@ def main(config: dict, args: argparse.Namespace | None = None) -> None:
 
     logger.info("====== PLR pipeline started ======")
     logger.info(
-        "States: %s | Quarter: %s | Dry-run: %s | Stages: %s",
+        "States: %s | Quarter: %s | Dry-run: %s | Stages: %s | Workers: %d",
         list(config['states'].keys()), quarter, dry_run,
-        sorted(active_stages),
+        sorted(active_stages), max_workers,
     )
 
     # --- Pre-flight validation ---
@@ -293,29 +379,69 @@ def main(config: dict, args: argparse.Namespace | None = None) -> None:
         return
 
     # --- Pipeline stages ---
-    if 'xgboost' in active_stages:
-        logger.info("Stage xgboost: XGBoost model predictions")
-        _run_xgboost(config, results)
+    if max_workers > 1:
+        # ------------------------------------------------------------------ #
+        # Parallel mode: each state runs all its stages in a worker process. #
+        # Results are merged back into the run report as workers complete.   #
+        # ------------------------------------------------------------------ #
+        logger.info(
+            "Parallel mode: dispatching %d state(s) across %d worker(s)",
+            len(config['states']), max_workers,
+        )
+        state_args = [
+            (abbr, data, list(active_stages))
+            for abbr, data in config['states'].items()
+        ]
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_process_state, a): a[0]
+                for a in state_args
+            }
+            for future in as_completed(futures):
+                abbr = futures[future]
+                try:
+                    returned: StateResult = future.result()
+                    # Merge the worker's StateResult back into the report object
+                    # (report holds a reference to results[abbr], so we update
+                    # it in place to keep the report consistent).
+                    original = results[abbr]
+                    for f in dataclass_fields(StateResult):
+                        if f.name not in ('abbr', 'state'):
+                            setattr(original, f.name, getattr(returned, f.name))
+                    logger.info(
+                        "Worker finished: %s — status=%s elapsed=%.1fs",
+                        abbr, returned.status, returned.elapsed_seconds,
+                    )
+                except Exception as exc:
+                    logger.exception("Worker for %s raised an unhandled exception", abbr)
+                    results[abbr].mark_stage_failed('pipeline', str(exc))
     else:
-        logger.info("Stage xgboost: skipped (not in --stages)")
+        # ------------------------------------------------------------------ #
+        # Sequential mode (default): stages run one at a time across states. #
+        # ------------------------------------------------------------------ #
+        if 'xgboost' in active_stages:
+            logger.info("Stage xgboost: XGBoost model predictions")
+            _run_xgboost(config, results)
+        else:
+            logger.info("Stage xgboost: skipped (not in --stages)")
 
-    if 'gis' in active_stages:
-        logger.info("Stage gis: GIS model predictions")
-        _run_gis_model(config, results)
-    else:
-        logger.info("Stage gis: skipped (not in --stages)")
+        if 'gis' in active_stages:
+            logger.info("Stage gis: GIS model predictions")
+            _run_gis_model(config, results)
+        else:
+            logger.info("Stage gis: skipped (not in --stages)")
 
-    if 'qc' in active_stages:
-        logger.info("Stage qc: QC process")
-        _run_qc(config, results)
-    else:
-        logger.info("Stage qc: skipped (not in --stages)")
+        if 'qc' in active_stages:
+            logger.info("Stage qc: QC process")
+            _run_qc(config, results)
+        else:
+            logger.info("Stage qc: skipped (not in --stages)")
 
-    if 'post_process' in active_stages:
-        logger.info("Stage post_process: Post-processing")
-        _run_post_process(config, results)
-    else:
-        logger.info("Stage post_process: skipped (not in --stages)")
+        if 'post_process' in active_stages:
+            logger.info("Stage post_process: Post-processing")
+            _run_post_process(config, results)
+        else:
+            logger.info("Stage post_process: skipped (not in --stages)")
 
     # --- Finalise and write run report ---
     total_elapsed = time.time() - pipeline_start
