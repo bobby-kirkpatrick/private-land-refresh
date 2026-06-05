@@ -39,3 +39,18 @@ PARALLEL_PROCESSING_FACTOR = "25%"
 
 # --- Sentinel value used in parcel owner fields for "no owner" ---
 NULL_OWNER_SENTINEL = '   ,    '
+
+# --- Privacy redaction ---
+# Path to the enterprise GDB feature class whose points identify properties
+# that must have all ownership information removed before delivery.
+# Set via .env or environment variable; not required by main.py.
+PRIVACY_POINTS_FC: str = os.getenv('PLR_PRIVACY_POINTS_FC', '')
+
+# Ownership / PII fields that are nulled out on redacted parcels.
+# gh_govt (classification) and gh_parcel_acres (area) are intentionally
+# excluded — they are not personally identifiable information.
+REDACT_FIELDS: tuple[str, ...] = (
+    'OWN1_LAST', 'OWN1_FRST',
+    'OWN2_LAST', 'OWN2_FRST',
+    'MAIL_ADDR', 'MAIL_ZIP', 'MAIL_STATE', 'MAIL_CITY',
+)
