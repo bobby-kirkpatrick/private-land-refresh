@@ -1,9 +1,9 @@
 """
 VTPK creation stage for the PLR pipeline.
 
-Generates vector tile packages from the ArcGIS Pro project that references
-the published enterprise GDB data.  One VTPK is produced per layer type
-(Private Land, Government Land) per state.
+Generates a single vector tile package per state from the ArcGIS Pro project
+that references the published enterprise GDB data.  Each VTPK contains both
+the Private Land and Government Land layers, visible simultaneously.
 
 Each call to ``create_vtpk()`` opens a fresh ``ArcGISProject`` instance so
 that concurrent callers (ThreadPoolExecutor) do not share mutable aprx state.
@@ -26,19 +26,14 @@ from configs.settings import (
 from utils.logging_config import get_logger
 from utils.vtpk_report import LayerVtpkResult
 
-# Ordered tuple used by vtpk_creator.py to iterate layers consistently.
-LAYER_TYPES: tuple[str, ...] = ('private_land', 'govt_land')
-
-# Maps layer_type keys to the aprx layer names configured in settings.
-_LAYER_NAME_MAP: dict[str, str] = {
-    'private_land': VTPK_PRIVATE_LAYER_NAME,
-    'govt_land':    VTPK_GOVT_LAYER_NAME,
-}
+# Both layer names that must be made visible before CreateVectorTilePackage.
+_TARGET_LAYER_NAMES: tuple[str, str] = (VTPK_PRIVATE_LAYER_NAME, VTPK_GOVT_LAYER_NAME)
 
 
 class PLR_vtpk:
     """
-    Creates VTPKs for one state from the aprx that references enterprise SDE data.
+    Creates a combined VTPK (Private Land + Government Land) for one state
+    from the aprx that references enterprise SDE data.
 
     Parameters
     ----------
@@ -52,7 +47,7 @@ class PLR_vtpk:
     aprx_path:
         Absolute path to the ``.aprx`` project file.
     output_path:
-        Directory where ``.vtpk`` files will be written.
+        Directory where the ``.vtpk`` file will be written.
     quarter:
         Quarter string (e.g. ``'Q2_2026'``).
     """
@@ -86,7 +81,7 @@ class PLR_vtpk:
 
         Tries the configured ``map_name`` first, then falls back to swapping
         spaces for underscores (and vice-versa) to tolerate minor naming
-        inconsistencies.
+        inconsistencies in the project file.
         """
         for candidate in (
             self.map_name,
@@ -102,27 +97,30 @@ class PLR_vtpk:
     # VTPK creation                                                        #
     # ------------------------------------------------------------------ #
 
-    def create_vtpk(self, layer_type: str) -> LayerVtpkResult:
+    def create_vtpk(self) -> LayerVtpkResult:
         """
-        Generate a VTPK for one layer type (``'private_land'`` or
-        ``'govt_land'``).
+        Generate a single VTPK containing both Private Land and Government
+        Land layers for this state.
 
-        Opens a fresh ``ArcGISProject`` instance to avoid thread-safety
-        issues when called concurrently.  Hides all non-target layers in
-        the map before calling ``CreateVectorTilePackage``.
+        Opens a fresh ``ArcGISProject`` instance (required for thread safety),
+        hides all non-target layers, makes both target layers visible, then
+        calls ``CreateVectorTilePackage``.
+
+        Output filename pattern: ``{abbr}_{quarter}.vtpk``
+        e.g. ``CO_Q2_2026.vtpk``
 
         Returns
         -------
         LayerVtpkResult
             Populated with the outcome of this operation.
         """
-        target_layer_name = _LAYER_NAME_MAP[layer_type]
-        vtpk_filename = f"{self.abbr}_{layer_type}_{self.quarter}.vtpk"
+        vtpk_filename = f"{self.abbr}_{self.quarter}.vtpk"
         vtpk_path = str(self.output_path / vtpk_filename)
+        layer_label = ' + '.join(_TARGET_LAYER_NAMES)
 
         result = LayerVtpkResult(
-            layer_type=layer_type,
-            layer_name=target_layer_name,
+            layer_type='combined',
+            layer_name=layer_label,
             map_name=self.map_name,
             vtpk_path=vtpk_path,
         )
@@ -141,11 +139,12 @@ class PLR_vtpk:
             self.logger.error("[%s] %s", self.abbr, result.error)
             return result
 
-        # Find target layer — non-group, case-insensitive name match
+        # Locate the two target layers (non-group, case-insensitive name match)
+        target_names_lower = {n.lower() for n in _TARGET_LAYER_NAMES}
         target_layers = [
             lyr for lyr in m.listLayers()
             if not lyr.isGroupLayer
-            and lyr.name.lower() == target_layer_name.lower()
+            and lyr.name.lower() in target_names_lower
         ]
 
         if not target_layers:
@@ -154,34 +153,36 @@ class PLR_vtpk:
             ]
             result.status = 'skipped'
             result.error = (
-                f"Layer '{target_layer_name}' not found in map '{m.name}'. "
-                f"Available layers: {available_layers}"
+                f"Neither '{VTPK_PRIVATE_LAYER_NAME}' nor '{VTPK_GOVT_LAYER_NAME}' "
+                f"found in map '{m.name}'. Available layers: {available_layers}"
             )
             self.logger.warning("[%s] %s", self.abbr, result.error)
             return result
 
-        if len(target_layers) > 1:
+        # Warn if only one of the two expected layers was found
+        found_names_lower = {lyr.name.lower() for lyr in target_layers}
+        missing = [n for n in _TARGET_LAYER_NAMES if n.lower() not in found_names_lower]
+        if missing:
             self.logger.warning(
-                "[%s] Multiple '%s' layers found in map '%s'. Using the first.",
-                self.abbr, target_layer_name, m.name,
+                "[%s] Layer(s) not found in map '%s' — VTPK will be partial: %s",
+                self.abbr, m.name, missing,
             )
 
-        target_layer = target_layers[0]
-
-        # Visibility: keep group layers on (so target inherits visibility
-        # through its ancestry), hide all non-group layers, then show target.
+        # Visibility: keep group layers on (preserves layer hierarchy rendering),
+        # hide every non-group layer, then show the two target layers only.
         for lyr in m.listLayers():
             lyr.visible = lyr.isGroupLayer
-        target_layer.visible = True
+        for lyr in target_layers:
+            lyr.visible = True
 
-        # Remove any pre-existing VTPK to prevent GP errors
+        # Remove any pre-existing VTPK to prevent GP tool errors
         if os.path.exists(vtpk_path):
             os.remove(vtpk_path)
             self.logger.debug("[%s] Removed existing VTPK: %s", self.abbr, vtpk_path)
 
         self.logger.info(
-            "[%s] Creating VTPK — layer='%s' → %s",
-            self.abbr, target_layer_name, vtpk_path,
+            "[%s] Creating VTPK — layers=[%s] → %s",
+            self.abbr, layer_label, vtpk_path,
         )
         arcpy.management.CreateVectorTilePackage(
             in_map=m,
@@ -197,12 +198,13 @@ class PLR_vtpk:
     # S3 upload                                                            #
     # ------------------------------------------------------------------ #
 
-    def upload_to_s3(self, vtpk_path: str, layer_type: str) -> bool:
+    def upload_to_s3(self, vtpk_path: str) -> bool:
         """
-        Upload a completed VTPK to S3.
+        Upload the completed VTPK to S3.
 
         S3 key pattern:
             ``{AWS_VTPK_S3_PREFIX}/{abbr.lower()}/{filename}``
+            e.g. ``vectortiles/co/CO_Q2_2026.vtpk``
 
         Returns
         -------
@@ -212,9 +214,9 @@ class PLR_vtpk:
         """
         if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
             self.logger.warning(
-                "[%s] AWS credentials not configured — skipping S3 upload for %s. "
+                "[%s] AWS credentials not configured — skipping S3 upload. "
                 "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in .env.",
-                self.abbr, layer_type,
+                self.abbr,
             )
             return False
 
@@ -232,13 +234,10 @@ class PLR_vtpk:
 
             s3_client.upload_file(vtpk_path, AWS_S3_BUCKET, s3_key)
             self.logger.info(
-                "[%s] Uploaded %s → s3://%s/%s",
-                self.abbr, layer_type, AWS_S3_BUCKET, s3_key,
+                "[%s] Uploaded → s3://%s/%s", self.abbr, AWS_S3_BUCKET, s3_key,
             )
             return True
 
         except Exception as exc:
-            self.logger.error(
-                "[%s] S3 upload failed for %s: %s", self.abbr, layer_type, exc,
-            )
+            self.logger.error("[%s] S3 upload failed: %s", self.abbr, exc)
             return False

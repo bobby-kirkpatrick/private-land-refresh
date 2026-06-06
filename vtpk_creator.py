@@ -34,7 +34,7 @@ Optional .env overrides
 Usage examples
 --------------
 # Export specific states (most common):
-    python vtpk_creator.py --states CO AZ UT
+    python vtpk_creator.py --states CO SD UT
 
 # Override the aprx and output folder on the fly:
     python vtpk_creator.py --states CO --aprx "D:\\aprx\\PLR.aprx" --output "D:\\vtpks"
@@ -60,7 +60,7 @@ import arcpy
 
 from configs import state_full
 from configs.settings import VTPK_DEFAULT_APRX, VTPK_DEFAULT_OUTPUT
-from geoprocessing.vtpk import LAYER_TYPES, PLR_vtpk
+from geoprocessing.vtpk import PLR_vtpk
 from utils.geo_utils import get_quarter
 from utils.logging_config import get_logger
 from utils.vtpk_report import LayerVtpkResult, StateVtpkResult, VtpkReport
@@ -191,39 +191,37 @@ def _export_state(
             quarter=quarter,
         )
 
-        for layer_type in LAYER_TYPES:
-            logger.info("[%s] Exporting %s…", abbr, layer_type)
-            try:
-                layer_result: LayerVtpkResult = creator.create_vtpk(layer_type)
-            except arcpy.ExecuteError:
-                msg = arcpy.GetMessages(2)
-                logger.error("[%s] ArcPy error on %s: %s", abbr, layer_type, msg)
-                layer_result = LayerVtpkResult(
-                    layer_type=layer_type,
-                    layer_name='',
-                    map_name=map_name,
-                    vtpk_path='',
-                    status='failed',
-                    error=msg,
-                )
-            except Exception as exc:
-                logger.exception("[%s] Unexpected error on %s", abbr, layer_type)
-                layer_result = LayerVtpkResult(
-                    layer_type=layer_type,
-                    layer_name='',
-                    map_name=map_name,
-                    vtpk_path='',
-                    status='failed',
-                    error=str(exc),
-                )
+        # One VTPK per state containing both Private Land and Government Land
+        logger.info("[%s] Exporting combined VTPK…", abbr)
+        try:
+            layer_result: LayerVtpkResult = creator.create_vtpk()
+        except arcpy.ExecuteError:
+            msg = arcpy.GetMessages(2)
+            logger.error("[%s] ArcPy error: %s", abbr, msg)
+            layer_result = LayerVtpkResult(
+                layer_type='combined',
+                layer_name='',
+                map_name=map_name,
+                vtpk_path='',
+                status='failed',
+                error=msg,
+            )
+        except Exception as exc:
+            logger.exception("[%s] Unexpected error during VTPK creation", abbr)
+            layer_result = LayerVtpkResult(
+                layer_type='combined',
+                layer_name='',
+                map_name=map_name,
+                vtpk_path='',
+                status='failed',
+                error=str(exc),
+            )
 
-            # Upload immediately after each successful VTPK creation
-            if upload and layer_result.status == 'success' and layer_result.vtpk_path:
-                layer_result.uploaded = creator.upload_to_s3(
-                    layer_result.vtpk_path, layer_type
-                )
+        # Upload immediately after successful creation
+        if upload and layer_result.status == 'success' and layer_result.vtpk_path:
+            layer_result.uploaded = creator.upload_to_s3(layer_result.vtpk_path)
 
-            state_result.layers.append(layer_result)
+        state_result.layers.append(layer_result)
 
         state_result.mark_complete()
         logger.info(
