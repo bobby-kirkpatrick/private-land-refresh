@@ -54,3 +54,22 @@ REDACT_FIELDS: tuple[str, ...] = (
     'OWN2_LAST', 'OWN2_FRST',
     'MAIL_ADDR', 'MAIL_ZIP', 'MAIL_STATE', 'MAIL_CITY',
 )
+
+# --- VTPK export settings ---
+# Names of the layers to target inside each state's aprx map.
+# Override via .env if your project uses different layer names.
+VTPK_PRIVATE_LAYER_NAME: str = os.getenv('PLR_VTPK_PRIVATE_LAYER', 'Private Land')
+VTPK_GOVT_LAYER_NAME: str = os.getenv('PLR_VTPK_GOVT_LAYER', 'Government Land')
+
+# Default paths used when --aprx / --output are not passed on the CLI.
+# Set in .env to avoid typing them on every invocation.
+VTPK_DEFAULT_APRX: str = os.getenv('PLR_VTPK_APRX_PATH', '')
+VTPK_DEFAULT_OUTPUT: str = os.getenv('PLR_VTPK_OUTPUT_FOLDER', '')
+
+# --- S3 upload settings ---
+# Credentials MUST come from .env — never hardcode them in source files.
+AWS_ACCESS_KEY_ID: str = os.getenv('AWS_ACCESS_KEY_ID', '')
+AWS_SECRET_ACCESS_KEY: str = os.getenv('AWS_SECRET_ACCESS_KEY', '')
+AWS_S3_BUCKET: str = os.getenv('AWS_S3_BUCKET', 'gh-gis-source-repo')
+# S3 prefix (folder) where VTPKs are stored, e.g. "vectortiles/co/CO_private_land_Q2_2026.vtpk"
+AWS_VTPK_S3_PREFIX: str = os.getenv('AWS_VTPK_S3_PREFIX', 'vectortiles')
