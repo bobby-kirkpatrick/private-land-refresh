@@ -73,3 +73,5 @@ AWS_SECRET_ACCESS_KEY: str = os.getenv('AWS_SECRET_ACCESS_KEY', '')
 AWS_S3_BUCKET: str = os.getenv('AWS_S3_BUCKET', 'gh-gis-source-repo')
 # S3 prefix (folder) where VTPKs are stored, e.g. "vectortiles/co/CO_private_land_Q2_2026.vtpk"
 AWS_VTPK_S3_PREFIX: str = os.getenv('AWS_VTPK_S3_PREFIX', 'vectortiles')
+# S3 prefix where release CSVs are stored, e.g. "vectortilerelease/hawaii_1780935493960.csv"
+AWS_VTPK_RELEASE_S3_PREFIX: str = os.getenv('AWS_VTPK_RELEASE_S3_PREFIX', 'vectortilerelease')

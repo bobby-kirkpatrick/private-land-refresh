@@ -60,7 +60,7 @@ import arcpy
 
 from configs import state_full
 from configs.settings import VTPK_DEFAULT_APRX, VTPK_DEFAULT_OUTPUT
-from geoprocessing.vtpk import PLR_vtpk
+from geoprocessing.vtpk import LAYER_TYPES, PLR_vtpk
 from utils.geo_utils import get_quarter
 from utils.logging_config import get_logger
 from utils.vtpk_report import LayerVtpkResult, StateVtpkResult, VtpkReport
@@ -170,12 +170,12 @@ def _export_state(
     aprx_path: str,
     output_folder: str,
     quarter: str,
+    timestamp: str,
     upload: bool,
     state_result: StateVtpkResult,
 ) -> None:
     """
-    Generate VTPKs for both layers of one state, then optionally upload
-    each to S3.
+    Generate a combined VTPK for one state, then optionally upload to S3.
 
     Designed to be called from a ``ThreadPoolExecutor`` worker.  All state
     is isolated to this call — no shared mutable references are used.
@@ -189,39 +189,47 @@ def _export_state(
             aprx_path=aprx_path,
             output_path=output_folder,
             quarter=quarter,
+            timestamp=timestamp,
         )
 
-        # One VTPK per state containing both Private Land and Government Land
-        logger.info("[%s] Exporting combined VTPK…", abbr)
-        try:
-            layer_result: LayerVtpkResult = creator.create_vtpk()
-        except arcpy.ExecuteError:
-            msg = arcpy.GetMessages(2)
-            logger.error("[%s] ArcPy error: %s", abbr, msg)
-            layer_result = LayerVtpkResult(
-                layer_type='combined',
-                layer_name='',
-                map_name=map_name,
-                vtpk_path='',
-                status='failed',
-                error=msg,
-            )
-        except Exception as exc:
-            logger.exception("[%s] Unexpected error during VTPK creation", abbr)
-            layer_result = LayerVtpkResult(
-                layer_type='combined',
-                layer_name='',
-                map_name=map_name,
-                vtpk_path='',
-                status='failed',
-                error=str(exc),
-            )
+        # Two VTPKs per state — one per layer — plus per-layer and state CSVs
+        for layer_type in LAYER_TYPES:
+            logger.info("[%s] Exporting %s…", abbr, layer_type)
+            try:
+                layer_result: LayerVtpkResult = creator.create_vtpk(layer_type)
+            except arcpy.ExecuteError:
+                msg = arcpy.GetMessages(2)
+                logger.error("[%s] ArcPy error on %s: %s", abbr, layer_type, msg)
+                layer_result = LayerVtpkResult(
+                    layer_type=layer_type,
+                    layer_name='',
+                    map_name=map_name,
+                    vtpk_path='',
+                    status='failed',
+                    error=msg,
+                )
+            except Exception as exc:
+                logger.exception("[%s] Unexpected error on %s", abbr, layer_type)
+                layer_result = LayerVtpkResult(
+                    layer_type=layer_type,
+                    layer_name='',
+                    map_name=map_name,
+                    vtpk_path='',
+                    status='failed',
+                    error=str(exc),
+                )
 
-        # Upload immediately after successful creation
-        if upload and layer_result.status == 'success' and layer_result.vtpk_path:
-            layer_result.uploaded = creator.upload_to_s3(layer_result.vtpk_path)
+            # Upload VTPK to S3 immediately after successful creation
+            if upload and layer_result.status == 'success' and layer_result.vtpk_path:
+                layer_result.uploaded = creator.upload_to_s3(layer_result.vtpk_path)
 
-        state_result.layers.append(layer_result)
+            state_result.layers.append(layer_result)
+
+        # Upload the completed state-level CSV (both rows now present) to S3
+        state_csv = creator.state_csv_path()
+        state_result.state_csv_path = state_csv
+        if upload and os.path.exists(state_csv):
+            state_result.state_csv_uploaded = creator.upload_csv_to_s3(state_csv)
 
         state_result.mark_complete()
         logger.info(
@@ -362,10 +370,15 @@ def main(args: argparse.Namespace) -> None:
         for abbr in valid
     }
 
+    # Generate timestamp once — shared across all states in this run so every
+    # VTPK from the same invocation carries the same ms-epoch stamp, matching
+    # the original naming convention: {map_lower}_{timestamp}_{layer_slug}.vtpk
+    timestamp = str(round(time.time() * 1000))
+
     logger.info("====== PLR VTPK export started ======")
     logger.info(
-        "States: %s | Quarter: %s | Workers: %d | S3: %s",
-        valid, quarter, args.max_workers, 'enabled' if upload else 'disabled',
+        "States: %s | Quarter: %s | Timestamp: %s | Workers: %d | S3: %s",
+        valid, quarter, timestamp, args.max_workers, 'enabled' if upload else 'disabled',
     )
 
     # --- Export: parallel by state when max_workers > 1 ---
@@ -379,6 +392,7 @@ def main(args: argparse.Namespace) -> None:
                     aprx_path,
                     output_folder,
                     quarter,
+                    timestamp,
                     upload,
                     results[abbr],
                 ): abbr
@@ -401,6 +415,7 @@ def main(args: argparse.Namespace) -> None:
                 aprx_path=aprx_path,
                 output_folder=output_folder,
                 quarter=quarter,
+                timestamp=timestamp,
                 upload=upload,
                 state_result=results[abbr],
             )

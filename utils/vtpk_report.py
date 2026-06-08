@@ -25,7 +25,7 @@ class LayerVtpkResult:
     map_name: str         # aprx map name used
     vtpk_path: str        # absolute local path to the .vtpk file
     status: str = 'pending'  # pending | success | skipped | failed
-    uploaded: bool = False   # True if S3 upload succeeded
+    uploaded: bool = False   # True if VTPK S3 upload succeeded
     error: str = ''          # populated on failure or skip
 
 
@@ -37,6 +37,8 @@ class StateVtpkResult:
     map_name: str
     status: str = 'pending'   # pending | success | partial | failed
     layers: list[LayerVtpkResult] = field(default_factory=list)
+    state_csv_path: str = ''         # combined release CSV (e.g. hawaii_….csv)
+    state_csv_uploaded: bool = False
     elapsed_seconds: float = 0.0
 
     def mark_complete(self) -> None:
@@ -115,10 +117,13 @@ class VtpkReport:
             icon = {'success': '✓', 'partial': '~', 'failed': '✗', 'pending': '?'}.get(
                 sr.status, '?'
             )
+            state_csv_tag = ' | state_csv=✓' if sr.state_csv_uploaded else ''
             lines.append(
                 f"  {icon} {sr.abbr} ({sr.state}) "
-                f"| map={sr.map_name} | {sr.elapsed_seconds:.1f}s"
+                f"| map={sr.map_name} | {sr.elapsed_seconds:.1f}s{state_csv_tag}"
             )
+            if sr.state_csv_path:
+                lines.append(f"      state CSV : {sr.state_csv_path}")
             for lr in sr.layers:
                 status_icon = (
                     '✓' if lr.status == 'success'
