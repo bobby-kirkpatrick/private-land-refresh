@@ -325,7 +325,7 @@ class PLR_vtpk:
             return False
         try:
             filename = os.path.basename(vtpk_path)
-            s3_key = f"{AWS_VTPK_S3_PREFIX}/{self.abbr.lower()}/{filename}"
+            s3_key = f"{AWS_VTPK_S3_PREFIX}/{self._state_slug}/{filename}"
             client.upload_file(vtpk_path, AWS_S3_BUCKET, s3_key)
             self.logger.info(
                 "[%s] VTPK uploaded → s3://%s/%s", self.abbr, AWS_S3_BUCKET, s3_key,
