@@ -187,7 +187,8 @@ class PLR_QC_model(BaseModel):
 
         overlap_intx: Path = self.temp_dir / f'{self.state}_govt_overlap_intx'
         if arcpy.Exists(str(overlap_intx)):
-            self.logger.info("%s govt overlap intx already exists", self.state)
+            self.logger.info("%s govt overlap intx already exists — repairing geometry", self.state)
+            arcpy.management.RepairGeometry(str(overlap_intx))
         else:
             arcpy.analysis.Intersect([govt_false, self.govt_land], str(overlap_intx))
             self.logger.info("%s govt overlap intx created", self.state)
@@ -206,7 +207,8 @@ class PLR_QC_model(BaseModel):
 
         govt_private_erase: Path = self.temp_dir / f'{self.state}_govt_land_private_erased'
         if arcpy.Exists(str(govt_private_erase)):
-            self.logger.info("%s govt private erase already exists", self.state)
+            self.logger.info("%s govt private erase already exists — repairing geometry", self.state)
+            arcpy.management.RepairGeometry(str(govt_private_erase))
         else:
             arcpy.analysis.Erase(self.govt_land, private_intx, str(govt_private_erase))
             self.logger.info("%s govt private erase created", self.state)
