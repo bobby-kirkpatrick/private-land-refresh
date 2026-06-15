@@ -177,8 +177,8 @@ class PLR_QC_model(BaseModel):
         # geometries that cause ERROR 160196 in the Erase tool. Repair both
         # inputs upfront so all four erase steps can complete cleanly.
         self.logger.info("Repairing geometry before overlap QC for %s…", self.state)
-        arcpy.management.RepairGeometry(self.parcels)
-        arcpy.management.RepairGeometry(self.govt_land)
+        arcpy.management.RepairGeometry(self.parcels, "DELETE_NULL")
+        arcpy.management.RepairGeometry(self.govt_land, "DELETE_NULL")
 
         govt_false = f"{self.state}_GovtFalse"
         arcpy.MakeFeatureLayer_management(
@@ -210,7 +210,7 @@ class PLR_QC_model(BaseModel):
             self.logger.info("%s govt private erase already exists — repairing geometry", self.state)
             arcpy.management.RepairGeometry(str(govt_private_erase))
         else:
-            arcpy.analysis.Erase(self.govt_land, private_intx, str(govt_private_erase))
+            arcpy.analysis.PairwiseErase(self.govt_land, private_intx, str(govt_private_erase))
             self.logger.info("%s govt private erase created", self.state)
 
         def _make_overlap_layer(name: str, where: str) -> str:
@@ -223,7 +223,7 @@ class PLR_QC_model(BaseModel):
         )
         erase_1: Path = self.temp_dir / f'{self.state}_parcels_erase_1'
         if not arcpy.Exists(str(erase_1)):
-            arcpy.analysis.Erase(self.parcels, no_name_govt, str(erase_1))
+            arcpy.analysis.PairwiseErase(self.parcels, no_name_govt, str(erase_1))
             self.logger.info("%s_parcels_erase_1 created", self.state)
 
         sliver = _make_overlap_layer(
@@ -232,7 +232,7 @@ class PLR_QC_model(BaseModel):
         )
         govt_sliver_erase: Path = self.temp_dir / f'{self.state}_govt_land_private_erased_2'
         if not arcpy.Exists(str(govt_sliver_erase)):
-            arcpy.analysis.Erase(str(govt_private_erase), sliver, str(govt_sliver_erase))
+            arcpy.analysis.PairwiseErase(str(govt_private_erase), sliver, str(govt_sliver_erase))
             self.logger.info("%s govt overlap sliver erase created", self.state)
 
         large_overlap = _make_overlap_layer(
@@ -241,7 +241,7 @@ class PLR_QC_model(BaseModel):
         )
         erase_2: Path = self.temp_dir / f'{self.state}_parcels_erase_2'
         if not arcpy.Exists(str(erase_2)):
-            arcpy.analysis.Erase(str(erase_1), large_overlap, str(erase_2))
+            arcpy.analysis.PairwiseErase(str(erase_1), large_overlap, str(erase_2))
             self.logger.info("%s_parcels_erase_2 created", self.state)
 
         govt_name_intx = _make_overlap_layer(
@@ -250,7 +250,7 @@ class PLR_QC_model(BaseModel):
         )
         erase_3: Path = self.temp_dir / f'{self.state}_parcels_erase_3'
         if not arcpy.Exists(str(erase_3)):
-            arcpy.analysis.Erase(str(erase_2), govt_name_intx, str(erase_3))
+            arcpy.analysis.PairwiseErase(str(erase_2), govt_name_intx, str(erase_3))
             self.logger.info("%s_parcels_erase_3 created", self.state)
 
         govt_centroid_intx = _make_overlap_layer(
@@ -259,7 +259,7 @@ class PLR_QC_model(BaseModel):
         )
         erase_4: Path = self.temp_dir / f'{self.state}_parcels_erase_4'
         if not arcpy.Exists(str(erase_4)):
-            arcpy.analysis.Erase(str(erase_3), govt_centroid_intx, str(erase_4))
+            arcpy.analysis.PairwiseErase(str(erase_3), govt_centroid_intx, str(erase_4))
             self.logger.info("%s_parcels_erase_4 created", self.state)
 
         self.logger.info("Overlap QC complete for %s", self.state)
