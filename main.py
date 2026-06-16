@@ -121,6 +121,7 @@ def _run_qc(config: dict, results: dict) -> None:
         try:
             model = PLR_QC_model(data, state)
             model.set_workspaces()
+            model.repair_geometry()
             model.qc_counts()
             model.label_qc()
             model.classification_counts()

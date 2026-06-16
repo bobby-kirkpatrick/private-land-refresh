@@ -14,6 +14,20 @@ from utils.qc_rules import apply_qc_rule
 class PLR_QC_model(BaseModel):
     """Quality-control stage that reconciles XGBoost vs GIS model disagreements."""
 
+    def repair_geometry(self) -> None:
+        """
+        Repair geometry on parcels and govt land before any QC geoprocessing.
+
+        DELETE_NULL removes features with null/empty geometry that would
+        otherwise cause ERROR 160196 in SymDiff, PairwiseErase, and similar
+        topology-sensitive tools.  Called again inside overlap_qc() because
+        gap_qc() inserts new features into self.govt_land between the two calls.
+        """
+        self.logger.info("Repairing geometry for %s…", self.state)
+        arcpy.management.RepairGeometry(self.parcels, "DELETE_NULL")
+        arcpy.management.RepairGeometry(self.govt_land, "DELETE_NULL")
+        self.logger.info("Geometry repair complete for %s", self.state)
+
     def qc_counts(self) -> None:
         """
         Log parcel counts and model agreement rates.
