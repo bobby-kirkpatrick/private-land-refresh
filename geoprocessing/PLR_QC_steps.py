@@ -142,21 +142,17 @@ class PLR_QC_model(BaseModel):
         if arcpy.Exists(str(sym_diff_fc)):
             self.logger.info("%s_symDiff already exists", self.state)
         else:
-            arcpy.analysis.SymDiff(govt_true, self.govt_land, str(sym_diff_fc), join_attributes="ONLY_FID")
+            # PairwiseErase(TRUE parcels, govt land) is geometrically equivalent to
+            # SymDiff filtered to the parcel side (FID_parcels <> -1), and avoids
+            # ERROR 160196 on topologically complex datasets where SymDiff fails.
+            arcpy.analysis.PairwiseErase(govt_true, self.govt_land, str(sym_diff_fc))
             self.logger.info("%s_symDiff created", self.state)
-
-        parcel_layer_name = self.parcels.split('.gdb\\')[1]
-        sym_diff_gap = f"{self.state}_symDiff_gap"
-        arcpy.MakeFeatureLayer_management(
-            str(sym_diff_fc), sym_diff_gap,
-            where_clause=f"FID_{parcel_layer_name} <> -1",
-        )
 
         sym_diff_sp: Path = self.temp_dir / f'{self.state}_SD_SP_fc'
         if arcpy.Exists(str(sym_diff_sp)):
             self.logger.info("%s_symDiff_singlePart already exists", self.state)
         else:
-            arcpy.MultipartToSinglepart_management(sym_diff_gap, str(sym_diff_sp))
+            arcpy.MultipartToSinglepart_management(str(sym_diff_fc), str(sym_diff_sp))
             arcpy.management.AddFields(str(sym_diff_sp), [
                 ['gap_acres', 'LONG', '', None, None, ''],
                 ['Unit_Nm',   'TEXT', '', None, None, ''],
@@ -204,7 +200,7 @@ class PLR_QC_model(BaseModel):
             self.logger.info("%s govt overlap intx already exists — repairing geometry", self.state)
             arcpy.management.RepairGeometry(str(overlap_intx))
         else:
-            arcpy.analysis.Intersect([govt_false, self.govt_land], str(overlap_intx))
+            arcpy.analysis.PairwiseIntersect([govt_false, self.govt_land], str(overlap_intx))
             self.logger.info("%s govt overlap intx created", self.state)
 
         try:
