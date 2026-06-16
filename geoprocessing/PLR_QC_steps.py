@@ -166,12 +166,15 @@ class PLR_QC_model(BaseModel):
             ]
             if missing:
                 arcpy.management.AddFields(str(sym_diff_sp), missing)
-            arcpy.management.CalculateField(str(sym_diff_sp), 'gap_acres', '!shape.area@acres!', 'PYTHON3')
-            self.logger.info("%s single-part gap acres calculated", self.state)
+
+        # Always recalculate — ensures gap_acres is current even when the FC
+        # was left in a partially-initialised state by a previous failed run.
+        arcpy.management.CalculateField(str(sym_diff_sp), 'gap_acres', '!shape.area@acres!', 'PYTHON3')
+        self.logger.info("%s single-part gap acres calculated", self.state)
 
         with arcpy.da.UpdateCursor(str(sym_diff_sp), 'gap_acres') as cursor:
             for row in cursor:
-                if row[0] >= GAP_ACRE_THRESHOLD:
+                if row[0] is None or row[0] >= GAP_ACRE_THRESHOLD:
                     cursor.deleteRow()
         self.logger.info("Gaps >= %d acres removed", GAP_ACRE_THRESHOLD)
 
