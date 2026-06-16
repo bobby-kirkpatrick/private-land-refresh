@@ -153,11 +153,19 @@ class PLR_QC_model(BaseModel):
             self.logger.info("%s_symDiff_singlePart already exists", self.state)
         else:
             arcpy.MultipartToSinglepart_management(str(sym_diff_fc), str(sym_diff_sp))
-            arcpy.management.AddFields(str(sym_diff_sp), [
-                ['gap_acres', 'LONG', '', None, None, ''],
-                ['Unit_Nm',   'TEXT', '', None, None, ''],
-                ['gh_govtype','TEXT', '', None, None, ''],
-            ])
+            # PairwiseErase inherits all parcel fields (including Unit_Nm / gh_govtype
+            # joined during the GIS stage), so only add fields that are missing.
+            existing = {f.name.lower() for f in arcpy.ListFields(str(sym_diff_sp))}
+            missing = [
+                f for f in [
+                    ['gap_acres', 'LONG', '', None, None, ''],
+                    ['Unit_Nm',   'TEXT', '', None, None, ''],
+                    ['gh_govtype','TEXT', '', None, None, ''],
+                ]
+                if f[0].lower() not in existing
+            ]
+            if missing:
+                arcpy.management.AddFields(str(sym_diff_sp), missing)
             arcpy.management.CalculateField(str(sym_diff_sp), 'gap_acres', '!shape.area@acres!', 'PYTHON3')
             self.logger.info("%s single-part gap acres calculated", self.state)
 
