@@ -1,4 +1,5 @@
 import csv
+import inspect
 import json
 from pathlib import Path
 
@@ -16,11 +17,98 @@ from utils.geo_utils import build_centroid_govt_intersect
 #   state_df['gh_govt'].map({'FALSE': 1, 'TRUE': 2, 'UNKNOWN': 3})
 _DEFAULT_INVERSE_LABEL_MAP: dict[int, str] = {1: 'FALSE', 2: 'TRUE', 3: 'UNKNOWN'}
 
-# XGBoost 1.x stored certain boolean parameters as integers (0/1) in the model
-# JSON.  XGBoost 2.x strictly requires boolean types and raises
-# "Invalid cast, from Integer to Boolean" when loading those older files.
-# This list covers the known offending fields.
-_XGB_LEGACY_BOOL_FIELDS = ['use_label_encoder']
+# Boolean fields that existed in XGBoost 1.x but are absent from the current
+# XGBClassifier sklearn signature (removed or renamed in 2.x).  Combined with
+# the inspect-based set, this covers both wrapper-level and booster-level fields.
+_XGB_REMOVED_BOOL_FIELDS: frozenset[str] = frozenset({
+    # sklearn wrapper (deprecated/removed)
+    'use_label_encoder',
+    # Learner / booster training params stored as 0/1 in XGBoost 1.x JSON
+    'disable_default_eval_metric',
+    'nthread_is_default',
+    'seed_per_iteration',
+    'boost_from_average',
+    # GBTree / hist booster params
+    'single_precision_histogram',
+    'dense_eval_ordering',
+    'has_categorical',
+    'allow_non_zero_for_missing',
+    'predict_raw_margin',
+    'training',
+    'use_draft_approx',
+    'special_missing',
+    'updater_seq',
+})
+
+# Key-name patterns that reliably indicate a boolean field in XGBoost model JSON.
+# These catch any additional booster-level fields not in the explicit set above.
+# NOTE: integers inside *arrays* are never converted (the key-name check only
+# applies to scalar dict values), so tree-node arrays like split_type are safe.
+_XGB_BOOL_PREFIXES: tuple[str, ...] = (
+    'use_', 'disable_', 'allow_', 'enable_', 'has_', 'is_', 'no_', 'with_', 'single_',
+)
+_XGB_BOOL_SUFFIXES: tuple[str, ...] = (
+    '_default', '_encoder', '_is_default', '_categorical',
+)
+
+
+def _xgb_bool_param_names() -> frozenset[str]:
+    """
+    Return the union of:
+      • XGBClassifier parameter names whose current default is a Python bool
+        (covers sklearn wrapper params present in the installed XGBoost version)
+      • _XGB_REMOVED_BOOL_FIELDS (booster-level / legacy params not in the
+        current sklearn signature but still present in older model JSON files)
+
+    Evaluated once at import time.
+    """
+    try:
+        dynamic = {
+            name
+            for name, param in inspect.signature(XGBClassifier.__init__).parameters.items()
+            if param.default is not inspect.Parameter.empty
+            and isinstance(param.default, bool)
+        }
+    except Exception:
+        dynamic = set()
+    return frozenset(dynamic | _XGB_REMOVED_BOOL_FIELDS)
+
+
+_XGB_BOOL_PARAMS: frozenset[str] = _xgb_bool_param_names()
+
+
+def _is_xgb_bool_field(key: str) -> bool:
+    """Return True if *key* names a field that should be boolean in XGBoost 2.x."""
+    if key in _XGB_BOOL_PARAMS:
+        return True
+    k = key.lower()
+    return (
+        any(k.startswith(p) for p in _XGB_BOOL_PREFIXES)
+        or any(k.endswith(s) for s in _XGB_BOOL_SUFFIXES)
+    )
+
+
+def _patch_bool_ints(obj: object, bool_keys: frozenset[str]) -> None:
+    """
+    Recursively walk a parsed JSON object and convert integer 0/1 values to
+    Python booleans for any key that names a boolean XGBoost parameter.
+
+    XGBoost 1.x serialised boolean parameters as JSON integers; XGBoost 2.x
+    requires proper JSON booleans when loading the same model file.
+    """
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            if (
+                isinstance(val, int) and not isinstance(val, bool)
+                and val in (0, 1)
+                and _is_xgb_bool_field(key)
+            ):
+                obj[key] = bool(val)
+            else:
+                _patch_bool_ints(val, bool_keys)
+    elif isinstance(obj, list):
+        for item in obj:
+            _patch_bool_ints(item, bool_keys)
 
 
 def _load_xgb_model(model_path: Path, logger) -> 'XGBClassifier':
@@ -30,10 +118,10 @@ def _load_xgb_model(model_path: Path, logger) -> 'XGBClassifier':
 
     If the standard load succeeds the patching is skipped entirely.
     A patched copy is written alongside the original as
-    ``<name>_compat.json`` so subsequent loads are fast.
+    ``<name>_compat.json`` so subsequent loads are fast.  If a stale compat
+    file exists but still fails to load (e.g. created by an older version of
+    this code with an incomplete field list), it is deleted and regenerated.
     """
-    import re
-
     xgb_model = XGBClassifier()
     try:
         xgb_model.load_model(str(model_path))
@@ -50,18 +138,34 @@ def _load_xgb_model(model_path: Path, logger) -> 'XGBClassifier':
 
     compat_path = model_path.with_name(model_path.stem + '_compat.json')
 
-    if not compat_path.exists():
-        with open(model_path, 'r', encoding='utf-8') as fh:
-            raw = fh.read()
-        for field in _XGB_LEGACY_BOOL_FIELDS:
-            raw = re.sub(rf'("{re.escape(field)}"\s*:\s*)0\b', r'\g<1>false', raw)
-            raw = re.sub(rf'("{re.escape(field)}"\s*:\s*)1\b', r'\g<1>true', raw)
-        with open(compat_path, 'w', encoding='utf-8') as fh:
-            fh.write(raw)
-        logger.info("Patched model written to %s", compat_path.name)
-    else:
-        logger.info("Using existing patched model %s", compat_path.name)
+    # Try reusing an existing compat file; delete it if it still fails to load.
+    if compat_path.exists():
+        try:
+            xgb_model = XGBClassifier()
+            xgb_model.load_model(str(compat_path))
+            logger.info("Model loaded via existing compatibility patch")
+            return xgb_model
+        except Exception:
+            logger.warning(
+                "Existing compat file %s still fails — regenerating with updated patch…",
+                compat_path.name,
+            )
+            compat_path.unlink()
 
+    # Build a fresh compat file using the full set of known boolean params.
+    with open(model_path, 'r', encoding='utf-8') as fh:
+        data = json.load(fh)
+
+    _patch_bool_ints(data, _XGB_BOOL_PARAMS)
+
+    with open(compat_path, 'w', encoding='utf-8') as fh:
+        json.dump(data, fh)
+    logger.info(
+        "Patched model written to %s (bool fields checked: %s)",
+        compat_path.name, sorted(_XGB_BOOL_PARAMS),
+    )
+
+    xgb_model = XGBClassifier()
     xgb_model.load_model(str(compat_path))
     logger.info("Model loaded successfully via compatibility patch")
     return xgb_model

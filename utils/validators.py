@@ -56,6 +56,10 @@ class PipelineValidationError(Exception):
 
 def _check_fc_exists(path: str, label: str, logger: logging.Logger) -> list[str]:
     """Return an error string if *path* does not exist as an arcpy dataset."""
+    if not path:
+        msg = f"[MISSING PATH] {label}: not configured — add this state to the parcel manifest"
+        logger.error(msg)
+        return [msg]
     if not arcpy.Exists(path):
         msg = f"[MISSING FC] {label}: {path}"
         logger.error(msg)
