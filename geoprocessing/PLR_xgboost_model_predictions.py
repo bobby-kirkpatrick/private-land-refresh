@@ -111,6 +111,46 @@ def _patch_bool_ints(obj: object, bool_keys: frozenset[str]) -> None:
             _patch_bool_ints(item, bool_keys)
 
 
+def _find_int01_scalars(obj: object, path: str = "", results: list | None = None) -> list[tuple[str, int]]:
+    """
+    Return (json_path, value) for every integer 0/1 scalar that still exists
+    inside a dict after targeted patching.  Used for diagnostic logging when
+    the targeted patch is insufficient.  Large arrays (tree node arrays) are
+    skipped to keep output readable.
+    """
+    if results is None:
+        results = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            cur = f"{path}/{k}" if path else k
+            if isinstance(v, int) and not isinstance(v, bool) and v in (0, 1):
+                results.append((cur, v))
+            else:
+                _find_int01_scalars(v, cur, results)
+    elif isinstance(obj, list) and len(obj) <= 8:
+        for i, item in enumerate(obj):
+            _find_int01_scalars(item, f"{path}[{i}]", results)
+    return results
+
+
+def _patch_all_bool_ints(obj: object) -> None:
+    """
+    Nuclear fallback: convert ALL integer 0/1 scalar values inside dicts to
+    Python bool, regardless of key name.  Integers inside *lists* (e.g. tree-
+    node arrays for split_type, cleft, cright) are intentionally left unchanged
+    so tree structure is not corrupted.
+    """
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            if isinstance(val, int) and not isinstance(val, bool) and val in (0, 1):
+                obj[key] = bool(val)
+            else:
+                _patch_all_bool_ints(val)
+    elif isinstance(obj, list):
+        for item in obj:
+            _patch_all_bool_ints(item)
+
+
 def _load_xgb_model(model_path: Path, logger) -> 'XGBClassifier':
     """
     Load an XGBoost model, patching integer-to-boolean type incompatibilities
@@ -165,9 +205,34 @@ def _load_xgb_model(model_path: Path, logger) -> 'XGBClassifier':
         compat_path.name, sorted(_XGB_BOOL_PARAMS),
     )
 
+    try:
+        xgb_model = XGBClassifier()
+        xgb_model.load_model(str(compat_path))
+        logger.info("Model loaded successfully via compatibility patch")
+        return xgb_model
+    except Exception as exc2:
+        if 'Invalid cast' not in str(exc2) and 'Boolean' not in str(exc2):
+            raise
+
+    # Targeted patch still insufficient — diagnose and escalate to nuclear compat.
+    remaining = _find_int01_scalars(data)
+    logger.warning(
+        "Targeted patch insufficient. Integer 0/1 scalars NOT converted "
+        "(add these to _XGB_REMOVED_BOOL_FIELDS if they are boolean):\n  %s",
+        "\n  ".join(f"{p}: {v}" for p, v in remaining) or "(none found in shallow scan)",
+    )
+
+    nuclear_path = model_path.with_name(model_path.stem + '_compat_nuclear.json')
+    with open(model_path, 'r', encoding='utf-8') as fh:
+        nuclear_data = json.load(fh)
+    _patch_all_bool_ints(nuclear_data)
+    with open(nuclear_path, 'w', encoding='utf-8') as fh:
+        json.dump(nuclear_data, fh)
+    logger.warning("Nuclear compat written to %s — attempting load…", nuclear_path.name)
+
     xgb_model = XGBClassifier()
-    xgb_model.load_model(str(compat_path))
-    logger.info("Model loaded successfully via compatibility patch")
+    xgb_model.load_model(str(nuclear_path))
+    logger.info("Model loaded via nuclear compatibility patch")
     return xgb_model
 
 
