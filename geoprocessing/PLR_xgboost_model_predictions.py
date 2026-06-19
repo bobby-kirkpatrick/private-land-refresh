@@ -2,6 +2,7 @@ import csv
 import inspect
 import json
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 import arcpy
 import pandas as pd
@@ -111,7 +112,7 @@ def _patch_bool_ints(obj: object, bool_keys: frozenset[str]) -> None:
             _patch_bool_ints(item, bool_keys)
 
 
-def _find_int01_scalars(obj: object, path: str = "", results: list | None = None) -> list[tuple[str, int]]:
+def _find_int01_scalars(obj: object, path: str = "", results: Optional[List[Tuple[str, int]]] = None) -> List[Tuple[str, int]]:
     """
     Return (json_path, value) for every integer 0/1 scalar that still exists
     inside a dict after targeted patching.  Used for diagnostic logging when
