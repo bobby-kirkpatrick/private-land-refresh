@@ -279,7 +279,9 @@ class PLR_xgboost_model(BaseModel):
             for row in cursor:
                 if row[0] in centroid_id_govt:
                     row[1] = 1
+                    row[2] = 0
                 else:
+                    row[1] = 0
                     row[2] = 1
                 cursor.updateRow(row)
 
