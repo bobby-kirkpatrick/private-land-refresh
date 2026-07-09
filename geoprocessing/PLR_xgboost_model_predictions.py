@@ -255,14 +255,11 @@ class PLR_xgboost_model(BaseModel):
         )
         self.dissolved_govt_features = str(dissolved_govt)
 
-        centroid_id_govt: dict = {}
-        with arcpy.da.SearchCursor(
-            str(centroid_intersect),
-            [f'FID_{self.state}_corelogic_centroids', 'PARCEL_ID'],
-        ) as cursor:
+        govt_parcel_ids: set = set()
+        with arcpy.da.SearchCursor(str(centroid_intersect), ['PARCEL_ID']) as cursor:
             for row in cursor:
-                centroid_id_govt[row[0]] = row[1]
-        self.logger.info("Centroid intersect dict built: %d records", len(centroid_id_govt))
+                govt_parcel_ids.add(row[0])
+        self.logger.info("Centroid intersect dict built: %d records", len(govt_parcel_ids))
 
         try:
             arcpy.management.AddFields(self.parcels, [
@@ -274,10 +271,10 @@ class PLR_xgboost_model(BaseModel):
             self.logger.debug("Centroid fields already exist, skipping")
 
         with arcpy.da.UpdateCursor(
-            self.parcels, ['OBJECTID', 'govt_centroid', 'private_centroid']
+            self.parcels, ['PARCEL_ID', 'govt_centroid', 'private_centroid']
         ) as cursor:
             for row in cursor:
-                if row[0] in centroid_id_govt:
+                if row[0] in govt_parcel_ids:
                     row[1] = 1
                     row[2] = 0
                 else:
