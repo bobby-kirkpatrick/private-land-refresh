@@ -52,6 +52,26 @@ _XGB_BOOL_SUFFIXES: tuple[str, ...] = (
     '_default', '_encoder', '_is_default', '_categorical',
 )
 
+# Fields that are always structural integers in XGBoost model JSON — values of
+# 0 or 1 are legitimate integers, not booleans.  The nuclear patch must never
+# convert these, otherwise XGBoost raises "Invalid cast, from Boolean to Integer"
+# when it tries to read back a tree index or node count.
+_XGB_INT_ONLY_FIELDS: frozenset[str] = frozenset({
+    'id',                # tree index inside the trees array
+    'num_trees',         # total number of boosting rounds
+    'num_nodes',         # node count per tree
+    'num_roots',         # always 1 for standard trees
+    'num_feature',       # number of input features
+    'num_deleted',       # deleted-node count (pruning bookkeeping)
+    'num_parallel_tree', # random-forest mode multiplier
+    'size_leaf_vector',  # 0 for single-output models
+    'num_output_group',  # output-group count
+    'num_class',         # class count for multiclass models
+    'best_iteration',    # early-stopping tracker
+    'best_ntree_limit',  # early-stopping limit
+    'n_estimators',      # sklearn-wrapper alias for num_trees
+})
+
 
 def _xgb_bool_param_names() -> frozenset[str]:
     """
@@ -112,37 +132,43 @@ def _patch_bool_ints(obj: object, bool_keys: frozenset[str]) -> None:
             _patch_bool_ints(item, bool_keys)
 
 
-def _find_int01_scalars(obj: object, path: str = "", results: Optional[List[Tuple[str, int]]] = None) -> List[Tuple[str, int]]:
+def _find_int01_keys(obj: object, found: Optional[set] = None) -> set:
     """
-    Return (json_path, value) for every integer 0/1 scalar that still exists
-    inside a dict after targeted patching.  Used for diagnostic logging when
-    the targeted patch is insufficient.  Large arrays (tree node arrays) are
-    skipped to keep output readable.
+    Return the set of key names that still have integer 0/1 scalar values
+    anywhere in the JSON tree after the targeted patch has run.
+
+    Groups by key name (not path) and traverses all lists without a size
+    limit, so fields buried inside the trees array are not missed.  Used for
+    diagnostic logging when the targeted patch is insufficient.
     """
-    if results is None:
-        results = []
+    if found is None:
+        found = set()
     if isinstance(obj, dict):
         for k, v in obj.items():
-            cur = f"{path}/{k}" if path else k
             if isinstance(v, int) and not isinstance(v, bool) and v in (0, 1):
-                results.append((cur, v))
+                found.add(k)
             else:
-                _find_int01_scalars(v, cur, results)
-    elif isinstance(obj, list) and len(obj) <= 8:
-        for i, item in enumerate(obj):
-            _find_int01_scalars(item, f"{path}[{i}]", results)
-    return results
+                _find_int01_keys(v, found)
+    elif isinstance(obj, list):
+        for item in obj:
+            _find_int01_keys(item, found)
+    return found
 
 
 def _patch_all_bool_ints(obj: object) -> None:
     """
-    Nuclear fallback: convert ALL integer 0/1 scalar values inside dicts to
-    Python bool, regardless of key name.  Integers inside *lists* (e.g. tree-
-    node arrays for split_type, cleft, cright) are intentionally left unchanged
-    so tree structure is not corrupted.
+    Nuclear fallback: convert integer 0/1 scalar dict values to Python bool,
+    skipping keys listed in _XGB_INT_ONLY_FIELDS (tree indices, node counts,
+    etc.) that are legitimate integers whose values happen to be 0 or 1.
+
+    Integers inside *lists* (e.g. tree-node arrays for split_type, cleft,
+    cright, default_left) are intentionally left unchanged so tree structure
+    is not corrupted.
     """
     if isinstance(obj, dict):
         for key, val in obj.items():
+            if key in _XGB_INT_ONLY_FIELDS:
+                continue  # structural integer — never convert
             if isinstance(val, int) and not isinstance(val, bool) and val in (0, 1):
                 obj[key] = bool(val)
             else:
@@ -214,13 +240,17 @@ def _load_xgb_model(model_path: Path, logger) -> 'XGBClassifier':
     except Exception as exc2:
         if 'Invalid cast' not in str(exc2) and 'Boolean' not in str(exc2):
             raise
+        logger.warning(
+            "Targeted patch load error (identifies which field still needs conversion): %s",
+            exc2,
+        )
 
     # Targeted patch still insufficient — diagnose and escalate to nuclear compat.
-    remaining = _find_int01_scalars(data)
+    remaining_keys = _find_int01_keys(data)
     logger.warning(
-        "Targeted patch insufficient. Integer 0/1 scalars NOT converted "
-        "(add these to _XGB_REMOVED_BOOL_FIELDS if they are boolean):\n  %s",
-        "\n  ".join(f"{p}: {v}" for p, v in remaining) or "(none found in shallow scan)",
+        "Targeted patch insufficient. Keys with remaining int 0/1 values "
+        "(add to _XGB_REMOVED_BOOL_FIELDS if they are boolean): %s",
+        sorted(remaining_keys) or "(none found — field may already be bool after patch)",
     )
 
     nuclear_path = model_path.with_name(model_path.stem + '_compat_nuclear.json')
