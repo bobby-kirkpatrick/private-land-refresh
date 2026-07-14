@@ -39,6 +39,9 @@ _XGB_REMOVED_BOOL_FIELDS: frozenset[str] = frozenset({
     'use_draft_approx',
     'special_missing',
     'updater_seq',
+    # Per-tree/per-node boolean flag stored as int 0/1 in XGBoost 1.x JSON;
+    # XGBoost 2.x expects a proper JSON boolean when loading the same model.
+    'id',
 })
 
 # Key-name patterns that reliably indicate a boolean field in XGBoost model JSON.
@@ -57,7 +60,6 @@ _XGB_BOOL_SUFFIXES: tuple[str, ...] = (
 # convert these, otherwise XGBoost raises "Invalid cast, from Boolean to Integer"
 # when it tries to read back a tree index or node count.
 _XGB_INT_ONLY_FIELDS: frozenset[str] = frozenset({
-    'id',                # tree index inside the trees array
     'num_trees',         # total number of boosting rounds
     'num_nodes',         # node count per tree
     'num_roots',         # always 1 for standard trees

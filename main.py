@@ -59,7 +59,7 @@ arcpy.env.parallelProcessingFactor = PARALLEL_PROCESSING_FACTOR
 # Pipeline stage functions
 # ---------------------------------------------------------------------------
 
-def _run_xgboost(config: dict, results: dict) -> None:
+def _run_xgboost(config: dict, results: dict, skip_repair: bool = False) -> None:
     for abbr, data in config['states'].items():
         state = state_full[abbr]
         result: StateResult = results[abbr]
@@ -68,7 +68,10 @@ def _run_xgboost(config: dict, results: dict) -> None:
         try:
             model = PLR_xgboost_model(data, state)
             model.set_workspaces()
-            model.repair_geometry()
+            if not skip_repair:
+                model.repair_geometry()
+            else:
+                logger.info("XGBoost %s: geometry repair skipped (--skip-repair)", state)
             model.add_centroid_attr()
             model.add_xgb_field()
             model.label_owner_type()
@@ -112,7 +115,7 @@ def _run_gis_model(config: dict, results: dict) -> None:
             result.elapsed_seconds += round(time.time() - stage_start, 2)
 
 
-def _run_qc(config: dict, results: dict) -> None:
+def _run_qc(config: dict, results: dict, skip_repair: bool = False) -> None:
     for abbr, data in config['states'].items():
         state = state_full[abbr]
         result: StateResult = results[abbr]
@@ -121,12 +124,15 @@ def _run_qc(config: dict, results: dict) -> None:
         try:
             model = PLR_QC_model(data, state)
             model.set_workspaces()
-            model.repair_geometry()
+            if not skip_repair:
+                model.repair_geometry()
+            else:
+                logger.info("QC %s: geometry repair skipped (--skip-repair)", state)
             model.qc_counts()
             model.label_qc()
             model.classification_counts()
             model.gap_qc()
-            model.overlap_qc()
+            model.overlap_qc(skip_repair=skip_repair)
             model.qc_post_process()
 
             # Harvest QC stats into the run report
@@ -214,7 +220,7 @@ def _process_state(args: tuple) -> StateResult:
     ``import arcpy`` and ``arcpy.env.parallelProcessingFactor = ...`` in
     isolation, giving every state its own fully independent arcpy session.
     """
-    abbr, data, active_stages_list = args
+    abbr, data, active_stages_list, skip_repair = args
     active_stages = frozenset(active_stages_list)
 
     # ------------------------------------------------------------------ #
@@ -256,11 +262,11 @@ def _process_state(args: tuple) -> StateResult:
     results_dict: dict[str, StateResult] = {abbr: result}
 
     if 'xgboost' in active_stages:
-        _run_xgboost(single_config, results_dict)
+        _run_xgboost(single_config, results_dict, skip_repair=skip_repair)
     if 'gis' in active_stages:
         _run_gis_model(single_config, results_dict)
     if 'qc' in active_stages:
-        _run_qc(single_config, results_dict)
+        _run_qc(single_config, results_dict, skip_repair=skip_repair)
     if 'post_process' in active_stages:
         _run_post_process(single_config, results_dict)
 
@@ -315,6 +321,15 @@ def _build_parser() -> argparse.ArgumentParser:
             'file under the logs directory when running in parallel.'
         ),
     )
+    parser.add_argument(
+        '--skip-repair', action='store_true',
+        help=(
+            'Skip RepairGeometry calls in the xgboost and qc stages. '
+            'Use only when geometry was already repaired on a prior run and '
+            'you are re-running to test a fix — NOT for production runs. '
+            'Skipping repair on dirty geometry can cause topology errors downstream.'
+        ),
+    )
     return parser
 
 
@@ -339,6 +354,7 @@ def main(config: dict, args: argparse.Namespace | None = None) -> None:
 
     dry_run = args is not None and args.dry_run
     max_workers: int = args.max_workers if args is not None and hasattr(args, 'max_workers') else 1
+    skip_repair: bool = args is not None and getattr(args, 'skip_repair', False)
 
     _ALL_STAGES = ('xgboost', 'gis', 'qc', 'post_process')
     active_stages: frozenset[str] = (
@@ -361,9 +377,9 @@ def main(config: dict, args: argparse.Namespace | None = None) -> None:
 
     logger.info("====== PLR pipeline started ======")
     logger.info(
-        "States: %s | Quarter: %s | Dry-run: %s | Stages: %s | Workers: %d",
+        "States: %s | Quarter: %s | Dry-run: %s | Stages: %s | Workers: %d | Skip-repair: %s",
         list(config['states'].keys()), quarter, dry_run,
-        sorted(active_stages), max_workers,
+        sorted(active_stages), max_workers, skip_repair,
     )
 
     # --- Pre-flight validation ---
@@ -390,7 +406,7 @@ def main(config: dict, args: argparse.Namespace | None = None) -> None:
             len(config['states']), max_workers,
         )
         state_args = [
-            (abbr, data, list(active_stages))
+            (abbr, data, list(active_stages), skip_repair)
             for abbr, data in config['states'].items()
         ]
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -422,7 +438,7 @@ def main(config: dict, args: argparse.Namespace | None = None) -> None:
         # ------------------------------------------------------------------ #
         if 'xgboost' in active_stages:
             logger.info("Stage xgboost: XGBoost model predictions")
-            _run_xgboost(config, results)
+            _run_xgboost(config, results, skip_repair=skip_repair)
         else:
             logger.info("Stage xgboost: skipped (not in --stages)")
 
@@ -434,7 +450,7 @@ def main(config: dict, args: argparse.Namespace | None = None) -> None:
 
         if 'qc' in active_stages:
             logger.info("Stage qc: QC process")
-            _run_qc(config, results)
+            _run_qc(config, results, skip_repair=skip_repair)
         else:
             logger.info("Stage qc: skipped (not in --stages)")
 

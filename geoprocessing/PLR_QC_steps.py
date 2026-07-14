@@ -192,14 +192,17 @@ class PLR_QC_model(BaseModel):
 
         self.logger.info("Gap QC features inserted into govt land layer")
 
-    def overlap_qc(self) -> None:
+    def overlap_qc(self, skip_repair: bool = False) -> None:
         """Erase government land from private parcels in overlapping areas."""
         # Large states (e.g. Ohio 6.4M parcels) can contain self-intersecting
         # geometries that cause ERROR 160196 in the Erase tool. Repair both
         # inputs upfront so all four erase steps can complete cleanly.
-        self.logger.info("Repairing geometry before overlap QC for %s…", self.state)
-        arcpy.management.RepairGeometry(self.parcels, "DELETE_NULL")
-        arcpy.management.RepairGeometry(self.govt_land, "DELETE_NULL")
+        if not skip_repair:
+            self.logger.info("Repairing geometry before overlap QC for %s…", self.state)
+            arcpy.management.RepairGeometry(self.parcels, "DELETE_NULL")
+            arcpy.management.RepairGeometry(self.govt_land, "DELETE_NULL")
+        else:
+            self.logger.info("Overlap QC %s: geometry repair skipped (--skip-repair)", self.state)
 
         govt_false = f"{self.state}_GovtFalse"
         arcpy.MakeFeatureLayer_management(
