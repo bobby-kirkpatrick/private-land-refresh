@@ -111,27 +111,40 @@ def _is_xgb_bool_field(key: str) -> bool:
     )
 
 
-def _patch_bool_ints(obj: object, bool_keys: frozenset[str]) -> None:
+def _patch_bool_ints(
+    obj: object,
+    bool_keys: frozenset[str],
+    _within_trees: bool = False,
+) -> None:
     """
     Recursively walk a parsed JSON object and convert integer 0/1 values to
     Python booleans for any key that names a boolean XGBoost parameter.
 
     XGBoost 1.x serialised boolean parameters as JSON integers; XGBoost 2.x
     requires proper JSON booleans when loading the same model file.
+
+    The ``id`` field appears in two contexts with different expected types:
+    - Outside the ``trees`` array (e.g. under ``objective``): boolean flag.
+    - Inside the ``trees`` array: integer tree index (0, 1, 2, …).
+    The ``_within_trees`` flag tracks which context we are in so only the
+    boolean instance is converted.
     """
     if isinstance(obj, dict):
         for key, val in obj.items():
+            in_trees = _within_trees or key == 'trees'
+            is_tree_id = key == 'id' and _within_trees
             if (
-                isinstance(val, int) and not isinstance(val, bool)
+                not is_tree_id
+                and isinstance(val, int) and not isinstance(val, bool)
                 and val in (0, 1)
                 and _is_xgb_bool_field(key)
             ):
                 obj[key] = bool(val)
             else:
-                _patch_bool_ints(val, bool_keys)
+                _patch_bool_ints(val, bool_keys, in_trees)
     elif isinstance(obj, list):
         for item in obj:
-            _patch_bool_ints(item, bool_keys)
+            _patch_bool_ints(item, bool_keys, _within_trees)
 
 
 def _find_int01_keys(obj: object, found: Optional[set] = None) -> set:
@@ -157,11 +170,14 @@ def _find_int01_keys(obj: object, found: Optional[set] = None) -> set:
     return found
 
 
-def _patch_all_bool_ints(obj: object) -> None:
+def _patch_all_bool_ints(obj: object, _within_trees: bool = False) -> None:
     """
     Nuclear fallback: convert integer 0/1 scalar dict values to Python bool,
     skipping keys listed in _XGB_INT_ONLY_FIELDS (tree indices, node counts,
     etc.) that are legitimate integers whose values happen to be 0 or 1.
+
+    Also skips ``id`` inside the ``trees`` array for the same reason as
+    _patch_bool_ints — tree indices 0 and 1 must stay integers.
 
     Integers inside *lists* (e.g. tree-node arrays for split_type, cleft,
     cright, default_left) are intentionally left unchanged so tree structure
@@ -169,15 +185,17 @@ def _patch_all_bool_ints(obj: object) -> None:
     """
     if isinstance(obj, dict):
         for key, val in obj.items():
-            if key in _XGB_INT_ONLY_FIELDS:
+            in_trees = _within_trees or key == 'trees'
+            is_tree_id = key == 'id' and _within_trees
+            if key in _XGB_INT_ONLY_FIELDS or is_tree_id:
                 continue  # structural integer — never convert
             if isinstance(val, int) and not isinstance(val, bool) and val in (0, 1):
                 obj[key] = bool(val)
             else:
-                _patch_all_bool_ints(val)
+                _patch_all_bool_ints(val, in_trees)
     elif isinstance(obj, list):
         for item in obj:
-            _patch_all_bool_ints(item)
+            _patch_all_bool_ints(item, _within_trees)
 
 
 def _load_xgb_model(model_path: Path, logger) -> 'XGBClassifier':
@@ -248,11 +266,11 @@ def _load_xgb_model(model_path: Path, logger) -> 'XGBClassifier':
         )
 
     # Targeted patch still insufficient — diagnose and escalate to nuclear compat.
-    remaining_keys = _find_int01_keys(data)
+    remaining_keys = _find_int01_keys(data) - {'id'}  # 'id' inside trees is intentionally kept as int
     logger.warning(
         "Targeted patch insufficient. Keys with remaining int 0/1 values "
-        "(add to _XGB_REMOVED_BOOL_FIELDS if they are boolean): %s",
-        sorted(remaining_keys) or "(none found — field may already be bool after patch)",
+        "(add to _XGB_REMOVED_BOOL_FIELDS if they are boolean, excluding 'id' which is a tree index): %s",
+        sorted(remaining_keys) or "(none found — all eligible fields patched)",
     )
 
     nuclear_path = model_path.with_name(model_path.stem + '_compat_nuclear.json')
