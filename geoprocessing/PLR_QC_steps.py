@@ -41,6 +41,16 @@ class PLR_QC_model(BaseModel):
         self.parcel_count: int = int(arcpy.GetCount_management(self.parcels)[0])
         self.logger.info("%s: %d total parcels", self.state, self.parcel_count)
 
+        # Log both label distributions so encoding mismatches are obvious.
+        gh_counts: dict = {}
+        xgb_counts: dict = {}
+        with arcpy.da.SearchCursor(self.parcels, ['gh_govt', 'xgb_gh_govt']) as cursor:
+            for row in cursor:
+                gh_counts[row[0]] = gh_counts.get(row[0], 0) + 1
+                xgb_counts[row[1]] = xgb_counts.get(row[1], 0) + 1
+        self.logger.info("%s GIS (gh_govt) distribution:    %s", self.state, gh_counts)
+        self.logger.info("%s XGB (xgb_gh_govt) distribution: %s", self.state, xgb_counts)
+
         agreement_layer = arcpy.SelectLayerByAttribute_management(
             self.parcels, "NEW_SELECTION", '"gh_govt" = "xgb_gh_govt"'
         )

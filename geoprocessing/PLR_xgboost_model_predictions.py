@@ -510,9 +510,33 @@ class PLR_xgboost_model(BaseModel):
         xgb_model = _load_xgb_model(model_path, self.logger)
 
         y_preds = xgb_model.predict(x_df)
+
+        from collections import Counter
+        raw_counts = Counter(int(v) for v in y_preds)
+        self.logger.info(
+            "Raw XGBoost prediction distribution (integer codes): %s",
+            dict(sorted(raw_counts.items())),
+        )
+
         pred_df = pd.DataFrame(y_preds, columns=['gh_govt_codes'])
         final_df = x_df.join(pred_df)
         final_df['gh_govt_xgboost'] = final_df['gh_govt_codes'].map(inverse_label_map)
+
+        unmapped = final_df['gh_govt_xgboost'].isna().sum()
+        if unmapped:
+            self.logger.warning(
+                "%d predictions could not be mapped via inverse_label_map %s "
+                "— raw codes not in map: %s",
+                unmapped, inverse_label_map,
+                sorted(set(int(v) for v in y_preds) - set(inverse_label_map.keys())),
+            )
+
+        label_counts = Counter(final_df['gh_govt_xgboost'].dropna())
+        self.logger.info(
+            "XGBoost label distribution (after inverse map): %s",
+            dict(sorted(label_counts.items())),
+        )
+
         final_df.drop(
             columns=[
                 'overlap_perc', 'govt_centroid', 'private_centroid',
